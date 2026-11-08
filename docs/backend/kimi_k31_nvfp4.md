@@ -3,11 +3,11 @@
 `KDA_NVFP4` and `DSA_NVFP4` independently select online NVFP4 W4A4 for the
 target model's external attention projections. Both accept `0` or `1` and
 default to `0` in an ordinary server launch. They are resolved when the model
-configuration is constructed; restart the service to change a selection.
+configuration is constructed. Restart the service to change a selection.
 
 Use the same original K3.1 checkpoint for all four ablations:
 
-| KDA_NVFP4 | DSA_NVFP4 | KDA projections | DSA projections |
+| KDA_NVFP4 | DSA_NVFP4 | KDA input and F_b | DSA input and Q-B |
 | --- | --- | --- | --- |
 | 0 | 0 | Original FP8 policy | Original FP8 policy |
 | 1 | 0 | NVFP4 W4A4 | Original FP8 policy |
@@ -15,7 +15,7 @@ Use the same original K3.1 checkpoint for all four ablations:
 | 1 | 1 | NVFP4 W4A4 | NVFP4 W4A4 |
 
 The FP8 control uses `QUANTIZATION=FP8_PER_BLOCK`. With quantization unset,
-unselected projections retain the original BF16 policy instead.
+unselected projections use the original BF16 policy.
 
 ```bash
 export KDA_NVFP4=1
@@ -26,9 +26,14 @@ export LOAD_METHOD=fastsafetensors
 # Start the normal kimi_k31 service with its original target and MTP checkpoints.
 ```
 
-KDA selection covers the fused `[Q,K,V,G,F_a,beta]` input projection, `F_b`,
-and output projection. DSA selection covers fused `[Q-A,KV-A,G]`, `Q-B`, and
-the output projection. The selection applies to every corresponding target layer.
+KDA selection covers the fused `[Q,K,V,G,F_a,beta]` input projection and `F_b`.
+DSA selection covers fused `[Q-A,KV-A,G]` and `Q-B`. With either switch
+enabled, that group's output projection uses grouped FP8 in both Prefill and
+Decode. For a TP-sharded output in eager Prefill, the existing FP8
+GEMM/ReduceScatter path uses DeepGEMM at 512 rows and above. Natural Query-CP
+DSA uses the FP8 full-head output projection and its usual reverse row exchange.
+On a dedicated Decode worker, target verify uses an FP8 GEMM that produces
+BF16 partials for push ReduceScatter.
 Indexer, KC/VC BMMs, KV storage, KDA state, convolution, routed/shared experts,
 MoE latent projections and native MLA MTP retain their existing precision policies.
 Target flags do not propagate to the draft model.
@@ -54,10 +59,10 @@ activation and TP communication path instead of feeding FP8 operands to FP4.
 Supported execution is CUDA13 on SM100/SM103 with the repository-pinned
 FlashInfer CUTLASS backend. Missing operands, unsupported layouts, another
 backend and load-time LoRA merging fail explicitly.
-Natural-order Prefill retains NVFP4: Q/gate are packed from the existing FP4
-codes, while KV uses a separate row slice. Local scales are reinterleaved for
-each slice, including boundaries inside a 128-row tile; weights are neither
-dequantized nor requantized. Startup/execution evidence requires both Q/gate
+Natural-order Prefill keeps its input projections in NVFP4. Q/gate are packed
+from the existing FP4 codes, and KV uses a separate row slice. Local scales
+are reinterleaved for each slice, including boundaries inside a 128-row tile.
+Startup/execution evidence requires both Q/gate
 and KV fragments on every natural-order Prefill rank.
 The removed `k31_nvfp4_modules` JSON override produces a migration error.
 Prepacked/calibrated NVFP4 exports are not inputs to this online mode.

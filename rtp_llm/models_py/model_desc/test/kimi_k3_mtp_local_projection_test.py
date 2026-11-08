@@ -21,6 +21,11 @@ class KimiK3MtpLocalProjectionTest(unittest.TestCase):
         model.config = SimpleNamespace(
             hidden_size=7168,
             k3_runtime_config=SimpleNamespace(attn_res_block_size=0),
+            attention_projection_quant_config=(
+                SimpleNamespace(get_method=lambda: "FP8_PER_BLOCK")
+                if dtype == torch.float8_e4m3fn
+                else None
+            ),
         )
         model._max_moe_tokens = 262144
         model._fp8_collective = None
@@ -29,7 +34,10 @@ class KimiK3MtpLocalProjectionTest(unittest.TestCase):
             setattr(
                 attention,
                 name,
-                SimpleNamespace(weight=torch.empty(1, dtype=dtype), scale_ue8m0=True),
+                SimpleNamespace(
+                    weight=torch.empty(1, dtype=dtype),
+                    scale_ue8m0=dtype == torch.float8_e4m3fn,
+                ),
             )
         layer = nn.Module()
         layer.attention = attention
@@ -62,6 +70,8 @@ class KimiK3MtpLocalProjectionTest(unittest.TestCase):
                     model.layers[0].attention.input.weight.device,
                     max_m=262144,
                     hidden_size=7168,
+                    enable_ag=True,
+                    enable_rs=True,
                     decode_staging=role == RoleType.DECODE,
                 )
                 self.assertIs(model._fp8_collective, collective.return_value)
@@ -86,6 +96,7 @@ class KimiK3MtpLocalProjectionTest(unittest.TestCase):
     def test_fp8_target_rejects_mixed_projection_precision(self):
         model = self._target_model(torch.float8_e4m3fn, RoleType.PREFILL)
         model.layers[0].attention.output.weight = torch.empty(1, dtype=torch.bfloat16)
+        model.layers[0].attention.output.scale_ue8m0 = False
         with self.assertRaisesRegex(ValueError, "grouped E4M3 projections"):
             model._initialize_fp8_collective()
 

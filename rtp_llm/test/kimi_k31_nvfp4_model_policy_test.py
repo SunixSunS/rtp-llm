@@ -5,8 +5,9 @@ from dataclasses import dataclass, replace
 import json
 import logging
 import os
+import sys
 from pathlib import Path
-from types import SimpleNamespace as NS
+from types import ModuleType, SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from rtp_llm.models.kimi_k3.nvfp4_config import (
     parse_nvfp4_flag,
     selected_nvfp4_modules,
     reject_legacy_nvfp4,
+    uses_fp8_output,
     validate_nvfp4_backend,
 )
 
@@ -95,6 +97,84 @@ def production_configs():
 
 
 class K31Nvfp4ModelPolicyTest(unittest.TestCase):
+    def test_output_creates_fp8_linear_under_the_nvfp4_switch(self):
+        path = Path(__file__).resolve().parents[1] / "models_py/modules/kimi_k3/projection.py"
+        function = next(
+            node for node in ast.parse(path.read_text()).body
+            if isinstance(node, ast.FunctionDef) and node.name == "create_kimi_projection"
+        )
+        scope = dict(
+            torch=NS(float8_e4m3fn="fp8", uint8="fp4"),
+            Fp8BlockWiseQuantConfig=lambda: "grouped_fp8",
+            LinearFactory=NS(create_linear=lambda weight, **kwargs: NS(weight=weight, **kwargs)),
+            uses_fp8_output=uses_fp8_output,
+        )
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), scope)
+        module = ModuleType("rtp_llm.models.kimi_k3.nvfp4_weight")
+        module.ATTENTION_PROJECTION_MODULES = {"kda_o": "kda.output", "dsa_o": "dsa.output"}
+        module.nvfp4_scale_keys = None
+        config = NS(k31_nvfp4_modules=selected_nvfp4_modules(True, True))
+        create = scope["create_kimi_projection"]
+        with patch.dict(sys.modules, {module.__name__: module}):
+            for name in module.ATTENTION_PROJECTION_MODULES:
+                weights = {name: NS(dtype="fp8"), "scale": object()}
+                projection = create(config, weights, name, "scale")
+                self.assertEqual(projection.quant_config, "grouped_fp8")
+                self.assertIs(projection.weight_scales, weights["scale"])
+                for dtype in ("bf16", "fp4"):
+                    weights[name].dtype = dtype
+                    with self.assertRaisesRegex(ValueError, "requires grouped FP8"):
+                        create(config, weights, name, "scale")
+
+    def test_weight_loader_keeps_output_fp8_for_each_enabled_group(self):
+        class BaseWeight:
+            _MLA_SUFFIXES = ()
+
+            def _attention_fp8_quant_config(self, source):
+                return self.model_config.attention_projection_quant_config
+
+        roles = NS(PREFILL="PREFILL", DECODE="DECODE", PDFUSION="PDFUSION")
+        root = Path(__file__).resolve().parents[1] / "models/kimi_k3"
+        path = root / "kimi_k31_weight.py"
+        cls = next(
+            node for node in ast.parse(path.read_text()).body
+            if isinstance(node, ast.ClassDef) and node.name == "KimiK31Weight"
+        )
+        native_fp8 = object()
+        scope = dict(
+            KimiK3Weight=BaseWeight, RoleType=roles,
+            Fp8BlockWiseQuantConfig=lambda: native_fp8,
+            uses_fp8_output=uses_fp8_output,
+        )
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), scope)
+        module = ModuleType("rtp_llm.models.kimi_k3.nvfp4_weight")
+        names = ("kda.input", "kda.forget", "kda.output", "dsa.input", "dsa.query", "dsa.output")
+        module.ATTENTION_PROJECTION_MODULES = {name: name for name in names}
+        module.KimiK31Nvfp4Weight = lambda source, module: NS(module=module)
+
+        with patch.dict(sys.modules, {module.__name__: module}):
+            for role in vars(roles).values():
+                for kda, dsa in ((False, False), (True, False), (False, True), (True, True)):
+                    with self.subTest(role=role, kda=kda, dsa=dsa):
+                        weight = scope["KimiK31Weight"].__new__(scope["KimiK31Weight"])
+                        weight.role_type = role
+                        selected = selected_nvfp4_modules(kda, dsa)
+                        weight.model_config = NS(
+                            k31_nvfp4_modules=selected,
+                            attention_projection_quant_config=None,
+                        )
+                        for name in names:
+                            source = NS(name=name)
+                            fp8_output = (name == "kda.output" and kda) or (name == "dsa.output" and dsa)
+                            fp4 = (name in ("kda.input", "kda.forget") and kda) or (
+                                name in ("dsa.input", "dsa.query") and dsa
+                            )
+                            self.assertEqual(weight._nvfp4_projection(source) is not source, fp4)
+                            self.assertIs(
+                                weight._attention_fp8_quant_config(source),
+                                native_fp8 if fp8_output else None,
+                            )
+
     def test_target_flags_keep_indexer_cache_and_mtp_independent(self):
         for kda in ("0", "1"):
             for dsa in ("0", "1"):

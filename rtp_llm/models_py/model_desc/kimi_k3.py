@@ -188,7 +188,7 @@ class KimiK3DecoderLayer(nn.Module):
         if self.block_size:
             previous = (self.index + self.block_size - 1) // self.block_size
             writes = self.index % self.block_size == 0
-            fp8_ag = self.attention._fp8_collective
+            fp8_ag = self.attention._fp8_input_collective
             produce_fp8 = (
                 fp8_ag is not None
                 and fp8_ag.enable_ag
@@ -397,33 +397,34 @@ class KimiK3Model(KimiK31ModelAdapter, GptModelBase):
         if type(self) is not KimiK3Model or self.tp_size == 1:
             return
         quant = getattr(self.config, "attention_projection_quant_config", None)
-        if quant is None or quant.get_method() != "FP8_PER_BLOCK":
-            return
-        if any(name.startswith(("kda.", "dsa."))
-               for name in getattr(self.config, "k31_nvfp4_modules", ())):
-            # The per-GEMM fallback retains ordinary BF16 TP collectives. Do
-            # not feed a prequantized FP8 activation to a selected W4A4 GEMM.
-            return
+        grouped_fp8 = quant is not None and quant.get_method() == "FP8_PER_BLOCK"
         decode_staging = self.parallelism_config.role_type == RoleType.DECODE
-        # Projection precision selects its matching modeling path. Runtime
-        # eligibility still handles phase, capacity, Graph and query layout.
-        enable_ag = enable_rs = True
+        fp8_ag_layers, fp8_rs_layers = [], []
+        for layer in self.layers:
+            attention = layer.attention
+            fp8_output = getattr(attention.output, "scale_ue8m0", False)
+            fp8_input = getattr(attention.input, "scale_ue8m0", False)
+            if grouped_fp8 and (
+                not fp8_output or (
+                    not fp8_input and not getattr(attention.input, "dynamic_input_scale", False)
+                )
+            ):
+                raise ValueError("FP8 collective fusion requires grouped E4M3 projections")
+            if fp8_output:
+                fp8_rs_layers.append(layer)
+                if fp8_input:
+                    fp8_ag_layers.append(layer)
+        if not fp8_rs_layers:
+            return
+        enable_ag = bool(fp8_ag_layers)
         if enable_ag and self.config.k3_runtime_config.attn_res_block_size:
             if self.config.hidden_size != 7168 or any(
                 (layer.index + layer.block_size - 1) // layer.block_size > 8
-                for layer in self.layers
+                for layer in fp8_ag_layers
             ):
                 raise ValueError(
                     "FP8 AttnRes fusion requires hidden_size=7168 and at most "
                     "8 residual blocks; validate the checkpoint before serving"
-                )
-        for layer in self.layers:
-            attention = layer.attention
-            if (enable_ag and not getattr(attention.input, "scale_ue8m0", False)) or (
-                enable_rs and not getattr(attention.output, "scale_ue8m0", False)
-            ):
-                raise ValueError(
-                    "FP8 collective fusion requires grouped E4M3 projections"
                 )
         from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_comm_fusion import (
             Fp8CollectiveProjection,
@@ -437,23 +438,30 @@ class KimiK3Model(KimiK31ModelAdapter, GptModelBase):
             max_m=max_m,
             hidden_size=self.config.hidden_size,
             enable_ag=enable_ag,
-            enable_rs=enable_rs,
+            enable_rs=True,
             decode_staging=decode_staging,
         )
-        for layer in self.layers:
-            layer.attention._fp8_collective = self._fp8_collective
+        collective = self._fp8_collective
+        for layer in fp8_rs_layers:
+            layer.attention._fp8_collective = collective
+        for layer in fp8_ag_layers:
+            layer.attention._fp8_input_collective = collective
             if layer.block_size:
                 layer.attention_residual.configure_verify_fp8(
                     decode_staging
                     and getattr(layer.attention, "supports_fp8_activation", False)
                 )
-            if decode_staging and enable_rs and isinstance(layer.mlp, KimiK3DenseMLP):
-                layer.mlp.output_transition = self._fp8_collective.reduce_scatter_bf16
+        if decode_staging and grouped_fp8:
+            for layer in self.layers:
+                if isinstance(layer.mlp, KimiK3DenseMLP):
+                    layer.mlp.output_transition = collective.reduce_scatter_bf16
         logging.info(
-            "FP8 TP projection fusion enabled: ag=%s rs=%s max_m=%d",
-            enable_ag,
-            enable_rs,
+            "K3 TP projection collectives: fp8_layers=%d decode_push_rs=%s "
+            "max_m=%d fp8_ag_layers=%d",
+            len(fp8_rs_layers),
+            decode_staging,
             max_m,
+            len(fp8_ag_layers),
         )
         return
 

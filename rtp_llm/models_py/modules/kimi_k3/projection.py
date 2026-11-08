@@ -7,6 +7,7 @@ import logging
 import torch
 
 from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig, ModelOptFp4Config
+from rtp_llm.models.kimi_k3.nvfp4_config import uses_fp8_output
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
 
 
@@ -18,11 +19,14 @@ def create_kimi_projection(config, weights, name, scale_key=None, hardware=None)
     selected = False
     if modules:
         from rtp_llm.models.kimi_k3.nvfp4_weight import (
-            NVFP4_WEIGHT_MODULES,
+            ATTENTION_PROJECTION_MODULES,
             nvfp4_scale_keys,
         )
 
-        selected = NVFP4_WEIGHT_MODULES.get(name) in modules
+        module = ATTENTION_PROJECTION_MODULES.get(name)
+        if uses_fp8_output(module, modules) and weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"{name}: attention output requires grouped FP8 weights")
+        selected = module in modules
     if selected:
         if getattr(config, "is_mtp", False):
             raise ValueError("NVFP4 cannot be used by the K3.1 MTP draft")

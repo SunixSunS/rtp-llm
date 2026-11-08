@@ -66,6 +66,7 @@ class KdaAttention(nn.Module):
             else self._project_forget_contiguous
         )
         self._fp8_collective = None
+        self._fp8_input_collective = None
         self._bf16_collective = None
 
     def _project_forget_contiguous(self, latent):
@@ -80,10 +81,8 @@ class KdaAttention(nn.Module):
         return self.f_b.forward_quantized(values, scales)
 
     def forward(self, hidden, fmha, cache, attention_inputs, metadata):
-        use_fused_ag = (
-            self._fp8_collective is not None
-            and self._fp8_collective.eligible_ag(hidden, attention_inputs, metadata)
-        )
+        fp8_ag = self._fp8_input_collective
+        use_fused_ag = fp8_ag is not None and fp8_ag.eligible_ag(hidden, attention_inputs, metadata)
         use_overlap = (
             self._ag_local_fp8_overlap
             and self.tp_size > 1
@@ -98,7 +97,7 @@ class KdaAttention(nn.Module):
             raise RuntimeError("prequantized FP8 input requires the FP8 AG/GEMM path")
         if use_fused_ag:
             with profile_scope("RTP::attention.fp8_ag_gemm"):
-                fused = self._fp8_collective.all_gather_gemm(hidden, self.input)
+                fused = fp8_ag.all_gather_gemm(hidden, self.input)
         elif self._bf16_collective is not None and self._bf16_collective.eligible(
             hidden.shape[0], attention_inputs, metadata,
         ):
