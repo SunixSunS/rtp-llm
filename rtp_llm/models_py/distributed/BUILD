@@ -3,8 +3,14 @@ py_library(
     srcs = [
         "collective_torch.py",
         "flashinfer_all_reduce.py",
+        "glm53_collective_gemm.py",
+        "glm53_mla_cp.py",
+        "pynccl_cp.py",
         "rocm_rccl.py",
+        "sequence_parallel.py",
         "symm_mem.py",
+        "tp_token_shard.py",
+        "zigzag_token_layout.py",
     ],
     deps = [
         "//rtp_llm:torch",
