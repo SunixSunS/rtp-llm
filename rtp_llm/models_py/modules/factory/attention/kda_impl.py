@@ -583,6 +583,8 @@ class KdaDecode(KdaBase):
         seq_size_per_block: int,
         attn_inputs: PyAttentionInputs,
         is_target_verify: bool,
+        *,
+        packed_qkv: bool = False,
     ) -> torch.Tensor:
         batch, seq = self._get_bs_from_attention_input(
             mixed_qkv, attn_inputs, is_target_verify
@@ -603,6 +605,12 @@ class KdaDecode(KdaBase):
             ],
             dim=2,
         )
+        if not packed_qkv:
+            query, key, value = (
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+            )
 
         # Compute gate: reshape to [B, S, local_H, D] for fused_recurrent
         forget_gate_2d = forget_gate.reshape(batch * seq, -1)
@@ -618,9 +626,9 @@ class KdaDecode(KdaBase):
         ssm_states = self._get_ssm_states(kv_cache_tensor)
 
         core_attn_out, _ = fused_recurrent_kda(
-            q=query.contiguous(),
-            k=key.contiguous(),
-            v=value.contiguous(),
+            q=query,
+            k=key,
+            v=value,
             g=g,
             beta=beta_out,
             scale=None,
@@ -675,13 +683,19 @@ class KdaDecode(KdaBase):
                 vector_gate=True,
                 state_v_first=False,
                 lower_bound=self.gate_lower_bound,
+                overlap_rebuild=True,
             )
+            if mixed_qkv.stride(-1) != 1:
+                mixed_qkv = mixed_qkv.contiguous()
             return self._linear_replay(
                 mixed_qkv, forget_gate, beta, attn_inputs.linear_replay
             )
 
+        packed_qkv = mixed_qkv.is_cuda and is_cuda()
+        if not packed_qkv or mixed_qkv.stride(-1) != 1:
+            mixed_qkv = mixed_qkv.contiguous()
         mixed_qkv = self._conv1d(
-            mixed_qkv.contiguous(),
+            mixed_qkv,
             kv_cache_tensor,
             kv_cache.seq_size_per_block,
             attn_inputs,
@@ -696,6 +710,7 @@ class KdaDecode(KdaBase):
             kv_cache.seq_size_per_block,
             attn_inputs,
             is_target_verify,
+            packed_qkv=packed_qkv,
         )
         return attn_out
 

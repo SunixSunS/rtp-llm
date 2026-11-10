@@ -17,3 +17,34 @@ py_test(
     tags = ["H20_CU13"],
     visibility = ["//visibility:public"],
 )
+
+py_test(
+    name = "kda_linear_replay_ab_test",
+    srcs = ["kda_linear_replay_ab_test.py"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm:torch",
+        "//rtp_llm:triton",
+        "//rtp_llm/models_py:utils",
+        "//rtp_llm/models_py/triton_kernels",
+    ],
+    env = {"GPU_COUNT": "1"},
+    exec_properties = {"gpu": "SM103_CU13", "gpu_count": "1"},
+    tags = ["SM103_CU13", "manual"],
+    timeout = "long",
+)
+
+py_test(
+    name = "kda_paged_decode_ab_test",
+    srcs = ["kda_paged_decode_ab_test.py"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm:torch",
+        "//rtp_llm:triton",
+        "//rtp_llm/models_py/triton_kernels:kda",
+    ],
+    env = {"GPU_COUNT": "1"},
+    exec_properties = {"gpu": "SM103_CU13", "gpu_count": "1"},
+    tags = ["SM103_CU13", "manual"],
+    timeout = "long",
+)

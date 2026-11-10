@@ -7,7 +7,7 @@ All request metadata remains on the device, including the acceptance length.
 
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any
 
 import torch
@@ -15,6 +15,11 @@ import triton
 import triton.language as tl
 
 from rtp_llm.models_py.triton_kernels.fla.op import exp, softplus
+
+
+@lru_cache(maxsize=None)
+def _rebuild_stream(device: torch.device) -> torch.cuda.Stream:
+    return torch.cuda.Stream(device=device)
 
 
 @triton.jit
@@ -516,6 +521,7 @@ class LinearReplay:
         vector_gate: bool,
         state_v_first: bool = True,
         lower_bound: float | None = None,
+        overlap_rebuild: bool = False,
     ):
         if layer_cache is None:
             raise ValueError(
@@ -584,6 +590,7 @@ class LinearReplay:
             vector_gate=vector_gate,
             state_v_first=state_v_first,
             lower_bound=lower_bound,
+            rebuild_stream=_rebuild_stream(device) if overlap_rebuild else None,
         )
 
     @classmethod
@@ -646,6 +653,7 @@ def _linear_serial_replay(
     vector_gate: bool,
     state_v_first: bool = True,
     lower_bound: float | None = None,
+    rebuild_stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Rebuild the accepted anchor and verify a dense, short token window."""
     # TODO(decode-cache-return): Save additional accepted LINEAR checkpoints
@@ -733,7 +741,8 @@ def _linear_serial_replay(
     tile_v = 32 if vector_gate else 8
     grid = (batch * hv, triton.cdiv(v, tile_v))
     warps = 4 if vector_gate else 1
-    _rebuild_state_kernel[grid](
+    rebuild = partial(
+        _rebuild_state_kernel[grid],
         ssm_pool,
         layer_cache.k,
         layer_cache.u,
@@ -753,6 +762,12 @@ def _linear_serial_replay(
         state_v_first,
         num_warps=warps,
     )
+    if rebuild_stream is not None and torch.cuda.is_current_stream_capturing():
+        main = torch.cuda.current_stream(device)
+        rebuild_stream.wait_stream(main)
+    else:
+        main = None
+        rebuild()
     convolved = torch.empty((tokens, channels), device=device, dtype=q_projected.dtype)
     _replay_conv_kernel[(batch, triton.cdiv(channels, 128))](
         q_projected,
@@ -781,6 +796,12 @@ def _linear_serial_replay(
         128,
         num_warps=4,
     )
+    if main is not None:
+        # SSM and convolution use disjoint state and history regions. Capture
+        # the main-stream convolution first so Verify can continue on its lane.
+        with torch.cuda.stream(rebuild_stream):
+            rebuild()
+        main.wait_stream(rebuild_stream)
     output = torch.empty((tokens, hv, v), device=device, dtype=q_projected.dtype)
     _serial_verify_kernel[grid](
         convolved,

@@ -1806,6 +1806,7 @@ def _rmsnorm_sigmoid_gate_group128_kernel(
     eps: tl.constexpr,
     block: tl.constexpr,
     masked: tl.constexpr,
+    valid_rows_stride: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     columns = tl.arange(0, block)
@@ -1813,7 +1814,7 @@ def _rmsnorm_sigmoid_gate_group128_kernel(
     dim = columns % 128
     valid = columns < heads * 128
     if masked:
-        valid = valid & tl.load(valid_rows + row)
+        valid = valid & tl.load(valid_rows + row * valid_rows_stride)
     a = tl.load(
         x + row * x_row_stride + head * x_head_stride + dim * x_dim_stride,
         valid,
@@ -1866,13 +1867,14 @@ def rmsnorm_sigmoid_gate_per_token_group_quant_fp8(
     if not x.is_cuda or gate.device != x.device or weight.device != x.device:
         raise ValueError("FP8 gated RMSNorm tensors must share a CUDA device")
     rows, heads, _ = x.shape
+    if valid_rows is not None and (
+        valid_rows.shape != (rows,)
+        or valid_rows.dtype != torch.bool
+        or valid_rows.device != x.device
+    ):
+        raise ValueError("valid_rows must be a boolean row mask on the input device")
     if heads <= 0:
         raise ValueError("FP8 gated RMSNorm requires at least one head")
-    if valid_rows is not None and (
-        valid_rows.shape != (rows,) or valid_rows.dtype != torch.bool
-        or valid_rows.device != x.device or not valid_rows.is_contiguous()
-    ):
-        raise ValueError("FP8 gated RMSNorm requires a contiguous CUDA bool row mask")
     width = heads * 128
     out = torch.empty((rows, width), device=x.device, dtype=torch.float8_e4m3fn)
     scale_wire = torch.empty(
@@ -1895,6 +1897,7 @@ def rmsnorm_sigmoid_gate_per_token_group_quant_fp8(
             eps,
             max(512, triton.next_power_of_2(width)),
             valid_rows is not None,
+            valid_rows.stride(0) if valid_rows is not None else 0,
         )
     return out, scale_wire.T[:rows, :]
 

@@ -54,6 +54,9 @@ def fused_recurrent_kda_fwd_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    stride_q_token: tl.constexpr,
+    stride_k_token: tl.constexpr,
+    stride_v_token: tl.constexpr,
     stride_beta_n: tl.constexpr,
     stride_beta_t: tl.constexpr,
     stride_beta_h: tl.constexpr,
@@ -75,6 +78,7 @@ def fused_recurrent_kda_fwd_kernel(
     STATE_V_FIRST: tl.constexpr,
     TRANSPOSE_STATE_LAYOUT: tl.constexpr,
     num_stages: tl.constexpr,
+    ZERO_INVALID: tl.constexpr,
 ):
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
@@ -108,9 +112,9 @@ def fused_recurrent_kda_fwd_kernel(
     i_hv_i64 = i_hv.to(tl.int64)
     o_v_i64 = o_v.to(tl.int64)
 
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
+    p_q = q + bos * stride_q_token + i_h * K + o_k
+    p_k = k + bos * stride_k_token + i_h * K + o_k
+    p_v = v + bos * stride_v_token + i_hv * V + o_v
     if IS_VARLEN:
         p_beta = beta + bos * stride_beta_t
     else:
@@ -139,9 +143,14 @@ def fused_recurrent_kda_fwd_kernel(
         if IS_CONTINUOUS_BATCHING:
             load_block_offset = cal_block_idx(sequence_length - 1, SEQ_SIZE_PER_BLOCK)
             read_block_id = tl.load(
-                block_map + i_n * max_block_size + load_block_offset
+                block_map + i_n * max_block_size + load_block_offset,
+                mask=sequence_length > 0 if ZERO_INVALID else True,
+                other=0,
             ).to(tl.int64)
             if read_block_id <= 0:
+                if ZERO_INVALID:
+                    for token in range(T):
+                        tl.store(p_o + token * HV * V, 0, mask=mask_v)
                 return
             p_h0 = h0 + read_block_id * stride_init_state_token + i_hv * K * V
         else:
@@ -234,10 +243,10 @@ def fused_recurrent_kda_fwd_kernel(
             p_ht += state_offset
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
-        p_q += H * K
-        p_k += H * K
+        p_q += stride_q_token
+        p_k += stride_k_token
         p_o += HV * V
-        p_v += HV * V
+        p_v += stride_v_token
         p_g += HV * K
         p_beta += stride_beta_t
 
@@ -269,6 +278,8 @@ def fused_recurrent_kda_fwd(
     lower_bound: Optional[float] = None,
     state_v_first: bool = False,
     transpose_state_layout: bool = True,
+    *,
+    zero_invalid_in_kernel: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -278,7 +289,14 @@ def fused_recurrent_kda_fwd(
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
 
-    o = torch.zeros_like(v)
+    zero_invalid_in_kernel = (
+        zero_invalid_in_kernel
+        and cu_seqlens is None
+        and block_map is not None
+        and initial_state is not None
+    )
+    allocate = torch.empty_like if zero_invalid_in_kernel else torch.zeros_like
+    o = allocate(v, memory_format=torch.contiguous_format)
     if inplace_final_state:
         assert initial_state is not None
         final_state = initial_state
@@ -301,6 +319,8 @@ def fused_recurrent_kda_fwd(
         assert block_map.ndim == 2, "block_map must be a 2D tensor"
         max_block_size = block_map.shape[1]
 
+    # Packed Q/K/V may have a pitched token axis with contiguous heads.
+    token_dim = 0 if T == 1 else 1
     grid = (NK * NV * N * HV,)
     fused_recurrent_kda_fwd_kernel[grid](
         q=q,
@@ -327,6 +347,9 @@ def fused_recurrent_kda_fwd(
         V=V,
         BK=BK,
         BV=BV,
+        stride_q_token=q.stride(token_dim),
+        stride_k_token=k.stride(token_dim),
+        stride_v_token=v.stride(token_dim),
         stride_beta_n=stride_beta_n,
         stride_beta_t=stride_beta_t,
         stride_beta_h=stride_beta_h,
@@ -342,6 +365,7 @@ def fused_recurrent_kda_fwd(
         ALLOW_NEG_EIGVAL=allow_neg_eigval,
         STATE_V_FIRST=state_v_first,
         TRANSPOSE_STATE_LAYOUT=transpose_state_layout,
+        ZERO_INVALID=zero_invalid_in_kernel,
         num_warps=1,
         num_stages=2 if transpose_state_layout else 3,
     )

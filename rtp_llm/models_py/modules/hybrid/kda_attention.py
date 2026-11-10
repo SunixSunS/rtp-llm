@@ -169,10 +169,7 @@ class KdaAttention(nn.Module):
         valid_mask = attention_inputs.valid_token_mask
         if layout is not None and layout.natural_all_valid:
             valid_mask = None
-        fused_mask = (
-            valid_mask if self._fp8_output_norm and metadata.is_target_verify else None
-        )
-        if valid_mask is not None and fused_mask is None:
+        if valid_mask is not None and not self._fp8_output_norm:
             # Paged KDA skips null-block rows, leaving their output unspecified.
             output = torch.where(valid_mask[:, None], output.reshape(-1, self.width), 0)
             gate = torch.where(valid_mask[:, None], gate, 0)
@@ -187,7 +184,7 @@ class KdaAttention(nn.Module):
                     gate.reshape(-1, self.heads, self.dim),
                     self.norm.weight,
                     self.norm.eps,
-                    valid_rows=fused_mask,
+                    valid_rows=valid_mask,
                 )
             else:
                 scatter_layout = None if outer_layout is not None and outer_layout.all_valid else layout
