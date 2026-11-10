@@ -60,6 +60,12 @@ public:
                                                          const SpecLogitsVerifyRunner::LaunchResult& spec_logits_result,
                                                          const torch::Tensor& draft_token_ids) const;
 
+    // Reads immutable request configuration only. No token history or sequence
+    // length may be touched while the previous bookkeeping worker owns them.
+    static bool                   canGatherStatelessGreedySpecSamplerInput(const StreamGroups& stream_groups);
+    absl::StatusOr<SamplerInputs> gatherStatelessGreedySpecSamplerInput(const StreamGroups&    stream_groups,
+                                                                        const GptModelOutputs& model_output) const;
+
     void prepareDecodeDraftModelInput(const StreamGroups& stream_groups,
                                       GptModelInputs&     model_input,
                                       TensorHolder&       host_holder);

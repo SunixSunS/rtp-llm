@@ -55,6 +55,10 @@ struct PyWrappedModelTestPeer {
     static bool generationPrefillCudaGraphReady(const PyWrappedModel& model) {
         return model.generation_prefill_graph_runner_ != nullptr;
     }
+
+    static void materializeHostAttentionInputs(PyWrappedModel& model, torch_ext::PyModelInputs& inputs) {
+        model.materializeHostAttentionInputs(inputs);
+    }
 };
 
 namespace {
@@ -361,6 +365,121 @@ torch::Tensor pinnedBoolTensor(size_t size, bool value) {
         torch::empty({static_cast<int64_t>(size)}, torch::TensorOptions().dtype(torch::kBool).pinned_memory(true));
     std::fill_n(tensor.data_ptr<bool>(), size, value);
     return tensor;
+}
+
+py::dict checkDeviceMetadataFallback(PyWrappedModel& model, bool is_prefill) {
+    const auto input    = pinnedTensor(is_prefill ? std::vector<int32_t>{2, 1, 3} : std::vector<int32_t>{1, 1, 1}, {3});
+    const auto prefix   = is_prefill ? pinnedTensor({61, 8191, 127}, {3}) : pinnedTensor({}, {0});
+    const auto sequence = is_prefill ? pinnedTensor({}, {0}) : pinnedTensor({64, 8192, 128}, {3});
+    const auto cu       = is_prefill ? pinnedTensor({0, 2, 3, 6}, {4}) : pinnedTensor({}, {0});
+    const auto cu_kv    = is_prefill ? pinnedTensor({0, 63, 8255, 8385}, {4}) : pinnedTensor({}, {0});
+    const auto decode_cu = is_prefill ? pinnedTensor({}, {0}) : pinnedTensor({0, 1, 2, 3}, {4});
+    const auto padding   = is_prefill ? pinnedTensor({0, 0, 1, 3, 3, 3}, {6}) : pinnedTensor({}, {0});
+    const std::vector<torch::Tensor> physical_tables{pinnedTensor({10, 11, 12, 13, 14, 15}, {3, 2}),
+                                                     pinnedTensor({20, 21, 22, 23, 24, 25}, {3, 2}),
+                                                     pinnedTensor({30, 31, 32, 33, 34, 35}, {3, 2})};
+    const std::vector<torch::Tensor> kernel_tables{pinnedTensor({110, 111, 112, 113, 114, 115}, {3, 2}),
+                                                   pinnedTensor({220, 221, 222, 223, 224, 225}, {3, 2}),
+                                                   pinnedTensor({330, 331, 332, 333, 334, 335}, {3, 2})};
+
+    torch_ext::PyModelInputs inputs;
+    auto&                    attention = inputs.attention_inputs;
+    attention.is_prefill               = is_prefill;
+    attention.is_target_verify         = is_prefill;
+    attention.device_only_metadata     = true;
+    attention.is_cuda_graph            = true;
+    attention.context_total_kv_length  = -1;
+    attention.total_tokens             = is_prefill ? 6 : 0;
+    attention.input_lengths = attention.input_lengths_device = input.cuda();
+    attention.prefix_lengths = attention.prefix_lengths_device = prefix.cuda();
+    attention.sequence_lengths                                 = sequence.cuda();
+    // The host cumulative mirrors deliberately start empty. For decode, both
+    // prefill GPU cumulative arrays are empty too: no prefill-only scalar may
+    // be indexed while materializing a decode fallback.
+    attention.cu_seqlens               = pinnedTensor({}, {0});
+    attention.cu_seqlens_device        = cu.cuda();
+    attention.cu_kv_seqlens_device     = cu_kv.cuda();
+    attention.decode_cu_seqlens        = pinnedTensor({}, {0});
+    attention.decode_cu_seqlens_device = decode_cu.cuda();
+    attention.padding_offset           = padding.cuda();
+    const auto assign_tables           = [&](torch_ext::PyAttentionInputs& target, size_t index) {
+        target.kv_cache_block_id = target.kv_cache_block_id_device = physical_tables[index].cuda();
+        target.kv_cache_kernel_block_id = target.kv_cache_kernel_block_id_device = kernel_tables[index].cuda();
+    };
+    assign_tables(attention, 0);
+    const std::vector<std::string> tags{"full", "linear"};
+    for (size_t index = 0; index < tags.size(); ++index) {
+        auto tagged = attention;
+        assign_tables(tagged, index + 1);
+        // Force the helper to propagate canonical metadata to each tag,
+        // while preserving that tag's distinct physical and kernel tables.
+        tagged.input_lengths           = pinnedTensor({90, 91, 92}, {3}).cuda();
+        tagged.context_total_kv_length = -7;
+        inputs.attention_inputs_by_tag.emplace(tags[index], std::move(tagged));
+    }
+    const auto original = inputs;
+    PyWrappedModelTestPeer::materializeHostAttentionInputs(model, inputs);
+
+    const auto expect_host = [](const torch::Tensor& actual, const torch::Tensor& expected, const char* field) {
+        RTP_LLM_CHECK_WITH_INFO(actual.defined() && !actual.is_cuda() && (actual.numel() == 0 || actual.is_pinned()),
+                                "fallback %s must be a pinned CPU tensor",
+                                field);
+        RTP_LLM_CHECK_WITH_INFO(torch::equal(actual, expected), "fallback %s has incorrect values", field);
+    };
+    const auto expect_device = [](const torch::Tensor& actual,
+                                  const torch::Tensor& previous,
+                                  const torch::Tensor& expected,
+                                  const char*          field) {
+        RTP_LLM_CHECK_WITH_INFO(actual.defined() && actual.is_cuda() && actual.data_ptr() == previous.data_ptr(),
+                                "fallback replaced device storage for %s",
+                                field);
+        RTP_LLM_CHECK_WITH_INFO(torch::equal(actual.cpu(), expected), "fallback changed device values for %s", field);
+    };
+    const auto verify = [&](const torch_ext::PyAttentionInputs& value,
+                            const torch_ext::PyAttentionInputs& previous,
+                            size_t                              table_index) {
+        RTP_LLM_CHECK_WITH_INFO(!value.device_only_metadata && !value.is_cuda_graph,
+                                "fallback left device-only/graph flags enabled");
+        RTP_LLM_CHECK_WITH_INFO(value.is_prefill == is_prefill && value.is_target_verify == is_prefill
+                                    && value.total_tokens == (is_prefill ? 6 : 0),
+                                "fallback changed attention role/token count");
+        RTP_LLM_CHECK_WITH_INFO(value.context_total_kv_length == (is_prefill ? 8385 : -1),
+                                "fallback has incorrect context_total_kv_length");
+        expect_host(value.input_lengths, input, "input_lengths");
+        expect_host(value.prefix_lengths, prefix, "prefix_lengths");
+        expect_host(value.sequence_lengths, sequence, "sequence_lengths");
+        expect_host(value.cu_seqlens, cu, "cu_seqlens");
+        expect_host(value.decode_cu_seqlens, decode_cu, "decode_cu_seqlens");
+        expect_device(value.input_lengths_device, previous.input_lengths_device, input, "input_lengths_device");
+        expect_device(value.prefix_lengths_device, previous.prefix_lengths_device, prefix, "prefix_lengths_device");
+        expect_device(value.cu_seqlens_device, previous.cu_seqlens_device, cu, "cu_seqlens_device");
+        expect_device(value.cu_kv_seqlens_device, previous.cu_kv_seqlens_device, cu_kv, "cu_kv_seqlens_device");
+        expect_device(
+            value.decode_cu_seqlens_device, previous.decode_cu_seqlens_device, decode_cu, "decode_cu_seqlens_device");
+        expect_device(value.padding_offset, previous.padding_offset, padding, "padding_offset");
+        expect_host(value.kv_cache_block_id, physical_tables[table_index], "physical_table");
+        expect_host(value.kv_cache_kernel_block_id, kernel_tables[table_index], "kernel_table");
+        expect_device(value.kv_cache_block_id_device,
+                      previous.kv_cache_block_id_device,
+                      physical_tables[table_index],
+                      "physical_table_device");
+        expect_device(value.kv_cache_kernel_block_id_device,
+                      previous.kv_cache_kernel_block_id_device,
+                      kernel_tables[table_index],
+                      "kernel_table_device");
+    };
+    verify(attention, original.attention_inputs, 0);
+    RTP_LLM_CHECK_WITH_INFO(inputs.attention_inputs_by_tag.size() == tags.size(), "fallback changed tag set");
+    for (size_t index = 0; index < tags.size(); ++index) {
+        verify(inputs.attention_inputs_by_tag.at(tags[index]),
+               original.attention_inputs_by_tag.at(tags[index]),
+               index + 1);
+    }
+    RTP_LLM_CHECK_WITH_INFO(torch::equal(original.attention_inputs.sequence_lengths.cpu(), sequence),
+                            "fallback changed original GPU sequence lengths");
+    py::dict result;
+    result["device_metadata_fallback_checked"] = true;
+    return result;
 }
 
 GptModelInputs makeInputs(const std::vector<int32_t>&     input_lengths,
@@ -1063,7 +1182,8 @@ py::list runTpSyncModelInputsScenario(int64_t                                   
                                       const std::vector<std::pair<bool, bool>>& flags,
                                       bool                                      skip_run,
                                       bool                                      initial_flags,
-                                      bool                                      grouped_cache) {
+                                      bool                                      grouped_cache,
+                                      bool                                      device_cache) {
     ParallelismConfig parallelism;
     parallelism.tp_rank = tp_rank;
     parallelism.tp_size = tp_size;
@@ -1079,6 +1199,11 @@ py::list runTpSyncModelInputsScenario(int64_t                                   
             inputs.kv_cache_kernel_block_id = pinnedTensor({131, 132, 111, 112}, {2, 1, 2});
             inputs.kv_cache_group_types     = pinnedTensor({0, 1}, {2});
             inputs.kv_cache_update_mapping  = pinnedTensor({0, 3, 4, 1, 1, 2}, {2, 3});
+            if (device_cache) {
+                inputs.kv_cache_block_id        = inputs.kv_cache_block_id.to(torch::kCUDA);
+                inputs.kv_cache_kernel_block_id = inputs.kv_cache_kernel_block_id.to(torch::kCUDA);
+                inputs.kv_cache_group_types     = inputs.kv_cache_group_types.to(torch::kCUDA);
+            }
         }
     }
     if (tp_rank == 0 && !skip_run) {
@@ -1137,13 +1262,16 @@ py::dict runPyWrappedModelCacheStoreScenario(py::object         py_model,
     RTP_LLM_CHECK_WITH_INFO(forward_count > 0, "forward_count must be positive");
 
     const bool cacheless_warmup = scenario_name == "cacheless_warmup";
+    const bool device_metadata_fallback =
+        scenario_name == "device_metadata_fallback_prefill" || scenario_name == "device_metadata_fallback_decode";
     const bool inspect_split = scenario_name == "micro_batch_split_pinned" || scenario_name == "micro_batch_split_cuda"
                                || scenario_name == "micro_batch_split_single_group"
                                || scenario_name == "micro_batch_split_2d";
     const bool single_group_split =
         scenario_name == "micro_batch_split_single_group" || scenario_name == "micro_batch_split_2d";
-    const auto input_scenario = inspect_split ? (single_group_split ? "micro_batch" : "micro_batch_multi_tag") :
-                                                (cacheless_warmup ? "multi_tag" : scenario_name);
+    const auto input_scenario = inspect_split ?
+                                    (single_group_split ? "micro_batch" : "micro_batch_multi_tag") :
+                                    (cacheless_warmup || device_metadata_fallback ? "multi_tag" : scenario_name);
     auto       scenario       = makeScenario(input_scenario);
     if (inspect_split) {
         scenario.inputs.kv_cache_kernel_block_id.add_(100);
@@ -1225,6 +1353,9 @@ py::dict runPyWrappedModelCacheStoreScenario(py::object         py_model,
     {
         PyWrappedModel                model(params, std::move(py_model));
         TestContextParallelProcessor* test_cp_processor = nullptr;
+        if (device_metadata_fallback) {
+            return checkDeviceMetadataFallback(model, scenario_name == "device_metadata_fallback_prefill");
+        }
         if (inspect_split) {
             const auto split = PyWrappedModelTestPeer::splitInputsIntoMicroBatches(model, scenario.inputs);
             py::list   batches;
@@ -1692,7 +1823,8 @@ PYBIND11_MODULE(libth_pywrapped_model_cache_store_integration_test, m) {
           py::arg("flags"),
           py::arg("skip_run"),
           py::arg("initial_flags") = false,
-          py::arg("grouped_cache") = false);
+          py::arg("grouped_cache") = false,
+          py::arg("device_cache")  = false);
     m.def("run_scenario",
           &rtp_llm::test::runPyWrappedModelCacheStoreScenario,
           py::arg("py_model"),

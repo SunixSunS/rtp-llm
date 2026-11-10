@@ -1031,6 +1031,61 @@ class TpSyncModelInputsIntegrationTest(unittest.TestCase):
                 )
                 self.assertSyncedBatches(results, skip_run)
 
+    def test_device_cache_rows_follow_rank_local_group_order(self) -> None:
+        # Exercise real GPU packing and permutation with a recorded collective
+        # transport. Multi-rank transport itself is covered by the UDS test.
+        frames = []
+
+        def unexpected_collective(*args):
+            self.fail("tpSyncModelInputs must only broadcast")
+
+        def record(tensors, root, mode):
+            self.assertEqual((root, mode), (0, 0))
+            frames.extend(tensor.clone() for tensor in tensors)
+
+        register_comm_ops(record, unexpected_collective, unexpected_collective)
+        root_results = run_tp_sync_model_inputs_scenario(
+            0, 4, _TP_SYNC_CAPTURE_FLAGS, False, False, True, True
+        )
+        self.assertTrue(any(frame.is_cuda for frame in frames))
+
+        for rank in (1, 2, 3):
+            cursor = 0
+
+            def replay(tensors, root, mode):
+                nonlocal cursor
+                self.assertEqual((root, mode), (0, 0))
+                for tensor in tensors:
+                    self.assertEqual(tensor.device, frames[cursor].device)
+                    self.assertEqual(tensor.shape, frames[cursor].shape)
+                    tensor.copy_(frames[cursor])
+                    cursor += 1
+
+            register_comm_ops(replay, unexpected_collective, unexpected_collective)
+            results = run_tp_sync_model_inputs_scenario(
+                rank, 4, _TP_SYNC_CAPTURE_FLAGS, False, False, True, True
+            )
+            self.assertEqual(cursor, len(frames))
+            for source, received in zip(root_results, results):
+                tags = received["group_tags"]
+                order = torch.tensor(
+                    [source["group_tags"].index(tag) for tag in tags],
+                    dtype=torch.int64,
+                    device="cuda",
+                )
+                for name in ("physical", "kernel", "group_types"):
+                    self.assertTrue(received[name].is_cuda)
+                    torch.testing.assert_close(
+                        received[name],
+                        source[name].index_select(0, order),
+                        rtol=0,
+                        atol=0,
+                    )
+                # Restore CPU mirrors only in the test's expected-value check.
+                for name in ("physical", "kernel", "group_types"):
+                    received[name] = received[name].cpu()
+            self.assertSyncedBatches(results, False, rank)
+
     def test_tp4_receives_flags_and_payload_over_uds(self) -> None:
         # Spawn avoids forking an initialized CUDA runtime. CPU payloads exercise
         # real TP transport without requiring four GPUs or model weights.
@@ -1060,6 +1115,19 @@ class TpSyncModelInputsIntegrationTest(unittest.TestCase):
 
 
 class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
+
+    def test_device_metadata_prefill_eager_fallback(self):
+        result = run_scenario(
+            CacheStoreForwardModel(), "device_metadata_fallback_prefill"
+        )
+        self.assertTrue(result["device_metadata_fallback_checked"])
+
+    def test_device_metadata_decode_eager_fallback(self):
+        result = run_scenario(
+            CacheStoreForwardModel(), "device_metadata_fallback_decode"
+        )
+        self.assertTrue(result["device_metadata_fallback_checked"])
+
     def test_borrowed_warmup_model_survives_until_owning_wrapper_is_destroyed(self):
         model = CloseAwareCacheStoreForwardModel()
         run_scenario(model, "multi_tag", owns_py_model=False)

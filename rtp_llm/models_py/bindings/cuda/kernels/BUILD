@@ -1,4 +1,4 @@
-load("//:def.bzl", "copts", "cuda_copts", "any_cuda_copts")
+load("//:def.bzl", "copts", "cuda_copts", "any_cuda_copts", "cc_test_wrapper")
 load("@local_config_cuda//cuda:build_defs.bzl", "cuda_default_copts_without_arch")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 package(default_visibility = ["//rtp_llm:__subpackages__"])
@@ -158,12 +158,53 @@ cc_library(
     name = "attention_input_metadata",
     srcs = ["attention_input_metadata.cu"],
     hdrs = ["attention_input_metadata.h"],
-    deps = [
-        "@local_config_cuda//cuda:cuda_headers",
-        "@local_config_cuda//cuda:cudart",
-    ] + torch_deps(),
-    copts = cuda_copts(),
+    deps = torch_deps() + select({
+        "@//:using_cuda": [
+            "@local_config_cuda//cuda:cuda_headers",
+            "@local_config_cuda//cuda:cudart",
+        ],
+        "@//:using_rocm": [
+            "@local_config_rocm//rocm:rocm_headers",
+            "@local_config_rocm//rocm:hip",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = any_cuda_copts(),
     visibility = ["//visibility:public"],
+)
+
+cc_test_wrapper(
+    name = "attention_input_metadata_test",
+    srcs = ["attention_input_metadata_test.cc"],
+    copts = copts(),
+    deps = [
+        ":attention_input_metadata",
+        "@com_google_googletest//:gtest_main",
+    ] + torch_deps() + select({
+        "@//:using_cuda": [
+            "@local_config_cuda//cuda:cuda_headers",
+            "@local_config_cuda//cuda:cudart",
+        ],
+        "@//:using_rocm": [
+            "@local_config_rocm//rocm:rocm_headers",
+            "@local_config_rocm//rocm:hip",
+        ],
+        "//conditions:default": [],
+    }),
+    env = select({
+        "@//:using_rocm": {"TEST_USING_DEVICE": "ROCM"},
+        "//conditions:default": {"TEST_USING_DEVICE": "CUDA"},
+    }),
+    exec_properties = select({
+        "@//:using_rocm": {"gpu": "MI308X-ROCM7"},
+        "//conditions:default": {"gpu": "L20_CU13"},
+    }),
+    target_compatible_with = select({
+        "@//:using_cuda": [],
+        "@//:using_rocm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    tags = ["L20_CU13", "MI308X-ROCM7"],
 )
 
 # Vendored from vLLM (csrc/persistent_topk.cuh + csrc/topk.cu @ b55d830).

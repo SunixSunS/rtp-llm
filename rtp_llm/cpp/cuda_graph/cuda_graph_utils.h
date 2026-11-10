@@ -57,6 +57,7 @@ public:
         py_model_inputs_.attention_inputs.is_prefill              = inputs.attention_inputs.is_prefill;
         py_model_inputs_.attention_inputs.is_target_verify        = inputs.attention_inputs.is_target_verify;
         py_model_inputs_.attention_inputs.is_cuda_graph           = inputs.attention_inputs.is_cuda_graph;
+        py_model_inputs_.attention_inputs.device_only_metadata    = inputs.attention_inputs.device_only_metadata;
         py_model_inputs_.attention_inputs.dtype                   = inputs.attention_inputs.dtype;
         py_model_inputs_.attention_inputs.context_total_kv_length = inputs.attention_inputs.context_total_kv_length;
 

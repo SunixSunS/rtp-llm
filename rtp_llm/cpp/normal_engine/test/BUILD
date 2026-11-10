@@ -112,10 +112,16 @@ cc_test(
         "//rtp_llm/cpp/testing:device_test_utils",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-    ] + torch_deps() + device_runtime_deps + cuda13_torch_link_deps,
+    ] + torch_deps() + device_runtime_deps + cuda13_torch_link_deps + select({
+        "@//:using_rocm": ["@local_config_rocm//rocm:hip"],
+        "//conditions:default": [],
+    }),
     env = device_test_envs(),
-    exec_properties = {"gpu": "L20_CU13"},
-    tags = ["L20_CU13"],
+    exec_properties = select({
+        "@//:using_rocm": {"gpu": "MI308X-ROCM7"},
+        "//conditions:default": {"gpu": "L20_CU13"},
+    }),
+    tags = ["rocm", "L20_CU13"],
 )
 
 # The executor caches RTP_LLM_STREAM_ASYNC, so test both settings in fresh processes.

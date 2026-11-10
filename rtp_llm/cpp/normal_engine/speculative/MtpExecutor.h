@@ -19,6 +19,7 @@
 #include "rtp_llm/cpp/normal_engine/AsyncRunner.h"
 #include "rtp_llm/cpp/models/logits_processor/SpecLogitsVerifyRunner.h"
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
+#include "rtp_llm/cpp/normal_engine/speculative/DecodeBufferRetirement.h"
 
 namespace rtp_llm {
 
@@ -46,6 +47,7 @@ public:
                          MlaOpsType                                     mla_ops_type       = MlaOpsType::AUTO,
                          int32_t                                        kv_cache_group_num = 1,
                          bool                                           warm_up            = false);
+    ~MtpExecutor() override;
 
     absl::Status process(const std::list<GenerateStreamPtr>& streams, int64_t schedule_time_us = 0) override;
     bool         updateEplbConfig(const EPLBConfig& config) override;
@@ -256,6 +258,10 @@ protected:
                                                   int64_t              verify_width);
 
     void releaseAllModelBuffers();
+    bool tryRetireNonRootDecode(const GptModelInputs&  inputs,
+                                const GptModelOutputs& target_output,
+                                const GptModelOutputs& draft_output);
+    void drainRetiredDecodeOnExit() noexcept;
 
 private:
     static torch::Tensor snapshotMutableHostInputToCuda(const torch::Tensor& tensor, TensorHolder& holder);
@@ -344,6 +350,9 @@ private:
     // Bookkeeping worker for stream-async decode dispatch. It owns a CUDA
     // stream + thread and runs D2H/specUpdate/KV release off the main thread.
     AsyncRunner spec_bookkeeping_runner_;
+
+    DecodeBufferRetirement       retired_decode_buffers_;
+    std::optional<torch::Stream> retired_decode_stream_;
 
     torch::Stream             dspark_cache_store_sync_stream_;
     torch::Tensor             dspark_cache_store_status_;

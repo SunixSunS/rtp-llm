@@ -315,6 +315,11 @@ struct PyAttentionInputs {
 
     // CUDA Graph mode flags
     bool is_cuda_graph = false;  // True when running in CUDA graph mode (capture or replay)
+    // Opt-in backend contract: length/cumulative/padding host mirrors are not
+    // maintained. Consumers must use device fields and host-known capacities.
+    // context_total_kv_length == -1 means the exact total is device-only, in
+    // cu_kv_seqlens_device[batch]. Eager fallback must materialize host metadata.
+    bool device_only_metadata = false;
 
     std::optional<PyContextParallelParams> context_parallel_info;
 

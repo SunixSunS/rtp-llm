@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include <ATen/record_function.h>
+#include <exception>
 #include <thread>
 #include <utility>
 
@@ -82,6 +83,22 @@ void AsyncRunner::workerLoop() {
                 event_.record(stream_);
             } catch (...) {
                 exception = std::current_exception();
+                // A failed task may already have queued copies/kernels, but
+                // has no valid completion event for sync() to wait on. Keep
+                // its captures and the caller's buffers alive until that work
+                // finishes, before publishing the original exception.
+                try {
+                    cuda_graph::toGraphStream(stream_).synchronize();
+                } catch (const std::exception& e) {
+                    RTP_LLM_LOG_ERROR("AsyncRunner failed to drain its worker stream after a task failure: %s; "
+                                      "terminating to prevent reuse of in-flight storage",
+                                      e.what());
+                    std::terminate();
+                } catch (...) {
+                    RTP_LLM_LOG_ERROR("AsyncRunner failed to drain its worker stream after a task failure; "
+                                      "terminating to prevent reuse of in-flight storage");
+                    std::terminate();
+                }
             }
         }
 

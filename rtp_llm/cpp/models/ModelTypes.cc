@@ -61,10 +61,17 @@ torch::Tensor reorderCacheRows(const torch::Tensor& tensor, const std::vector<in
     RTP_LLM_CHECK_WITH_INFO(tensor.dim() == (block_table ? 3 : 1)
                                 && tensor.size(0) == static_cast<int64_t>(rows.size()),
                             "cache payload row count must match its group tags (groups)");
-    if (rows.size() <= 1) {
+    if (std::is_sorted(rows.begin(), rows.end())) {
         return tensor;
     }
-    auto result = tensor.index_select(0, torch::tensor(rows, torch::kInt64).to(tensor.device()));
+    // The permutation is host configuration, independent of queued GPU work.
+    // A blocking .to(device) here drains the previous decode round merely to
+    // upload a few group indices. PyTorch's pinned allocator retains the source
+    // allocation until the nonblocking copy's stream event has completed.
+    auto indices = torch::empty({static_cast<int64_t>(rows.size())},
+                                torch::TensorOptions().dtype(torch::kInt64).pinned_memory(tensor.is_cuda()));
+    std::copy(rows.begin(), rows.end(), indices.data_ptr<int64_t>());
+    auto result = tensor.index_select(0, indices.to(tensor.device(), /*non_blocking=*/true));
     return tensor.is_pinned() && !result.is_pinned() ? result.pin_memory() : result;
 }
 

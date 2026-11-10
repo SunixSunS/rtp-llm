@@ -928,9 +928,15 @@ void MtpBatchStreamProcessor::overlayMtpCacheSnapshots(const StreamGroups& strea
                                     "MTP cache snapshot exceeds destination width: source=%ld destination=%ld",
                                     source.size(2),
                                     destination.size(2));
-            const int64_t copy_width  = source.size(2);
-            auto          row_indices = torch::tensor(rows, torch::TensorOptions().dtype(torch::kInt64))
-                                   .to(destination.device(), /*non_blocking=*/true);
+            const int64_t copy_width = source.size(2);
+            // ROCm can return before a pageable H2D source has been consumed.
+            // Torch-owned pinned storage is retained by the allocator's copy
+            // event, even after this temporary leaves scope.
+            auto row_indices_cpu =
+                torch::empty({static_cast<int64_t>(rows.size())},
+                             torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true));
+            std::copy(rows.begin(), rows.end(), row_indices_cpu.data_ptr<int64_t>());
+            auto row_indices = row_indices_cpu.to(destination.device(), /*non_blocking=*/true);
             destination.narrow(2, 0, copy_width).index_copy_(1, row_indices, source);
         };
 
@@ -1069,6 +1075,82 @@ MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&             
 
     RTP_LLM_LOG_DEBUG("gatherSamplerInput done");
     return sampler_inputs;
+}
+
+bool MtpBatchStreamProcessor::canGatherStatelessGreedySpecSamplerInput(const StreamGroups& stream_groups) {
+#if !USING_ROCM
+    return false;
+#else
+    const char* compact_env = std::getenv("RTP_LLM_MTP_COMPACT_GREEDY_HISTORY");
+    if ((compact_env != nullptr && std::strcmp(compact_env, "0") == 0) || stream_groups.empty()
+        || stream_groups.needReturnAllProbs() != ReturnAllProbsMode::DEFAULT || stream_groups.needReturnCumLogProbs()) {
+        return false;
+    }
+    for (const auto& stream : stream_groups.allStreams()) {
+        const auto& config = stream->generateConfig();
+        // current/nextNumBeams() read mutable output history even for one beam.
+        if (config->stochastic() || stream->hasNumBeams() || stream->maxBatchSize() != 1
+            || config->repetition_penalty != 1.0f || config->presence_penalty != 0.0f
+            || config->frequency_penalty != 0.0f || config->no_repeat_ngram_size.value_or(0) != 0
+            || !stream->getAllLogitsProcessorPtr().empty()) {
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
+absl::StatusOr<SamplerInputs>
+MtpBatchStreamProcessor::gatherStatelessGreedySpecSamplerInput(const StreamGroups&    stream_groups,
+                                                               const GptModelOutputs& model_output) const {
+    RTP_LLM_PROFILE_SCOPE("mtp_batch_stream_processor.gather_stateless_greedy_spec_sampler_input");
+    if (!canGatherStatelessGreedySpecSamplerInput(stream_groups)) {
+        return absl::InvalidArgumentError("stateless MTP sampling requires history-independent ROCm greedy requests");
+    }
+    const auto rows = static_cast<int64_t>(stream_groups.size() * (propose_step_ + 1));
+    RTP_LLM_CHECK_WITH_INFO(model_output.logits.defined() && model_output.logits.is_cuda()
+                                && model_output.logits.dim() == 2 && model_output.logits.size(0) == rows
+                                && model_output.logits.size(1) >= static_cast<int64_t>(vocab_size_),
+                            "stateless MTP sampling requires device logits [B*(gamma+1), padded_vocab]");
+    SamplerInputs inputs;
+    inputs.batch_size = inputs.batch_size_out = rows;
+    inputs.vocab_size                         = vocab_size_;
+    // ROCm's identity-penalty top-1 path writes the final column without
+    // consuming input_lengths, sequence_lengths, step or previous token IDs.
+    // Use a self-consistent empty history, preserving the same sampling kernel
+    // and temperature handling as gatherSpecSamplerInput + Sampler::forward.
+    inputs.step                 = 0;
+    inputs.input_lengths        = torch::zeros({rows}, torch::kInt32);
+    inputs.sequence_lengths     = torch::zeros({rows}, torch::kInt32);
+    inputs.num_beams_in         = torch::ones({rows}, torch::kLong);
+    inputs.num_beams_out        = torch::ones({rows}, torch::kLong);
+    inputs.finished_mask        = torch::zeros({rows}, torch::kBool);
+    const auto pinned_i32       = torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true);
+    const auto pinned_f32       = torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true);
+    const auto pinned_bool      = torch::TensorOptions().dtype(torch::kBool).pinned_memory(true);
+    inputs.top_k                = torch::ones({rows}, pinned_i32);
+    inputs.top_p                = torch::empty({rows}, pinned_f32);
+    inputs.temperature          = torch::empty({rows}, pinned_f32);
+    inputs.do_sample            = torch::empty({rows}, pinned_bool);
+    inputs.repetition_penalty   = torch::ones({rows}, pinned_f32);
+    inputs.presence_penalty     = torch::zeros({rows}, pinned_f32);
+    inputs.frequency_penalty    = torch::zeros({rows}, pinned_f32);
+    inputs.no_repeat_ngram_size = torch::zeros({rows}, pinned_i32);
+    inputs.generator.reserve(rows);
+    int64_t row = 0;
+    for (const auto& stream : stream_groups.allStreams()) {
+        const auto& config = stream->generateConfig();
+        for (size_t i = 0; i <= propose_step_; ++i, ++row) {
+            inputs.top_p.data_ptr<float>()[row]       = config->do_sample ? config->top_p : 1.0f;
+            inputs.temperature.data_ptr<float>()[row] = config->do_sample ? config->temperature : 1.0f;
+            inputs.do_sample.data_ptr<bool>()[row]    = config->do_sample;
+            inputs.generator.push_back(stream->getGenerator());
+        }
+    }
+    inputs.token_ids = torch::empty({rows, 1}, model_output.logits.options().dtype(torch::kInt32));
+    inputs.all_probs = torch::zeros({rows, static_cast<int64_t>(vocab_size_)}, model_output.logits.options());
+    inputs.logits    = model_output.logits.narrow(1, 0, static_cast<int64_t>(vocab_size_)).clone();
+    return inputs;
 }
 
 void MtpBatchStreamProcessor::updateProposeTokens(const StreamGroups&                stream_groups,
@@ -1336,15 +1418,28 @@ void MtpBatchStreamProcessor::updateDecodeDraftModelInput(GptModelInputs&       
 
     if (model_input.combo_position_ids.defined()) {
         const size_t position_id_len_factor = model_input_gatherer_config_.position_id_len_factor;
-        auto         next_position_ids =
-            torch::empty({(int64_t)(batch_size * position_id_len_factor)}, torch::kInt32).pin_memory();
-        int*       dst_position_ids = next_position_ids.data_ptr<int>();
-        const auto src_position_ids = model_input.combo_position_ids.cpu().contiguous();
-        const int* src              = src_position_ids.data_ptr<int>();
-        for (int64_t i = 0; i < next_position_ids.numel(); ++i) {
-            dst_position_ids[i] = src[i] + 1;
+        const int64_t position_count         = static_cast<int64_t>(batch_size * position_id_len_factor);
+        if (model_input.combo_position_ids.is_cuda()) {
+            RTP_LLM_CHECK_WITH_INFO(model_input.combo_position_ids.scalar_type() == torch::kInt32
+                                        && model_input.combo_position_ids.numel() == position_count,
+                                    "MTP draft position ids must be int32 with %ld values, got dtype=%d numel=%ld",
+                                    position_count,
+                                    static_cast<int>(model_input.combo_position_ids.scalar_type()),
+                                    model_input.combo_position_ids.numel());
+            // Each MRoPE axis advances by one while preserving its offset.
+            // Keep device-authoritative positions on the current stream; a
+            // host mirror here waits for all preceding draft/target GPU work.
+            model_input.combo_position_ids = model_input.combo_position_ids.reshape({position_count}) + 1;
+        } else {
+            auto       next_position_ids = torch::empty({position_count}, torch::kInt32).pin_memory();
+            int*       dst_position_ids  = next_position_ids.data_ptr<int>();
+            const auto src_position_ids  = model_input.combo_position_ids.cpu().contiguous();
+            const int* src               = src_position_ids.data_ptr<int>();
+            for (int64_t i = 0; i < next_position_ids.numel(); ++i) {
+                dst_position_ids[i] = src[i] + 1;
+            }
+            model_input.combo_position_ids = std::move(next_position_ids);
         }
-        model_input.combo_position_ids = std::move(next_position_ids);
     }
 
     if (useMtpDeviceInput() || model_input.sequence_lengths.is_cuda()) {
@@ -1775,12 +1870,15 @@ void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGrou
                                                                 std::vector<torch::Tensor>& draft_token_probs_list) {
     std::vector<torch::Tensor> prev_draft_token_probs_list;
     for (const auto& stream : stream_groups.allStreams()) {
-        auto sp_output_buffer = stream->getSPOutputBuffer();
         // Prefer device-state draft_all_probs (see comment in
         // updateOneStepDraftSamplerOutput for the same fallback contract).
         const auto& dev_probs = stream->getDraftAllProbsGpu();
-        prev_draft_token_probs_list.push_back(useMtpDeviceState() && dev_probs.defined() ? dev_probs :
-                                                                                           sp_output_buffer->all_probs);
+        if (useMtpDeviceState() && dev_probs.defined()) {
+            prev_draft_token_probs_list.push_back(dev_probs);
+        } else {
+            // The caller must have joined bookkeeping before this fallback.
+            prev_draft_token_probs_list.push_back(stream->getSPOutputBuffer()->all_probs);
+        }
     }
 
     auto pre_draft_token_probs = torch::stack(prev_draft_token_probs_list, 0).contiguous();

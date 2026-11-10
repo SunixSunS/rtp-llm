@@ -134,6 +134,34 @@ py_library(
 )
 
 py_test(
+    name = "cuda_graph_device_metadata_test",
+    srcs = ["cuda_graph_device_metadata_test.py", "cuda_graph_tagged_cache_test.py"],
+    data = [":test_cuda_graph_runner", "//:th_transformer"],
+    deps = [
+        ":cuda_graph_test_utils",
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm/test/model_test/test_util:test_util",
+    ],
+    env = select({
+        "@//:using_rocm": {
+            "LOAD_METHOD": "scratch",
+            "NOT_USE_DEFAULT_STREAM": "1",
+            "TEST_USING_DEVICE": "ROCM",
+        },
+        "//conditions:default": {
+            "LOAD_METHOD": "scratch",
+            "NOT_USE_DEFAULT_STREAM": "1",
+            "TEST_USING_DEVICE": "CUDA",
+        },
+    }),
+    tags = ["rocm", "L20_CU13"],
+    exec_properties = select({
+        "@//:using_rocm": {"gpu": "MI308X-ROCM7"},
+        "//conditions:default": {"gpu": "L20_CU13"},
+    }),
+)
+
+py_test(
     name = "cuda_graph_decode_padding",
     srcs = [
         "cuda_graph_decode_padding.py",

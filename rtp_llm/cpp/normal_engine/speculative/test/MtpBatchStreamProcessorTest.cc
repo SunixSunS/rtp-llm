@@ -3,6 +3,8 @@
 #include <cstring>
 #include <memory>
 #include <limits>
+#include <functional>
+#include <utility>
 #include "torch/all.h"
 #if USING_CUDA
 #include "c10/cuda/CUDAGuard.h"
@@ -20,6 +22,7 @@
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
+#include "rtp_llm/cpp/models/Sampler.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorStates.h"
 #include "rtp_llm/cpp/models/logits_processor/ThinkModeLogitsProcessor.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
@@ -175,6 +178,150 @@ public:
     using MtpBatchStreamProcessor::MtpBatchStreamProcessor;
     using MtpBatchStreamProcessor::overlayMtpCacheSnapshots;
 };
+
+#if USING_ROCM
+TEST_F(MtpBatchStreamProcessorTest, StatelessGreedyMatchesLegacySamplingAndRejectionWithoutHostHistory) {
+    autil::EnvGuard compact_guard("RTP_LLM_MTP_COMPACT_GREEDY_HISTORY", "1");
+    constexpr int   vocab_size        = 64;
+    constexpr int   padded_vocab_size = 68;
+    ModelConfig     model_config;
+    model_config.max_seq_len = 2048;
+    model_config.vocab_size  = vocab_size;
+    model_config.num_layers  = 1;
+    RuntimeConfig              runtime_config;
+    ResourceContext            resource_context;
+    SpeculativeExecutionConfig sp_config;
+    sp_config.gen_num_per_cycle = 2;
+    MtpBatchStreamProcessor processor(
+        model_config, PDSepConfig{}, ProfilingDebugLoggingConfig{}, makeProcessorCacheConfig(), sp_config, false);
+    Sampler                         legacy_sampler(SamplerInitParams{48, true});
+    Sampler                         stateless_sampler(SamplerInitParams{48, true});
+    speculative::SpeculativeSampler legacy_rejection({}, 2), stateless_rejection({}, 2);
+    for (int batch : {1, 4, 16, 4, 1}) {
+        SCOPED_TRACE(batch);
+        std::list<GenerateStreamPtr> streams;
+        for (int i = 0; i < batch; ++i) {
+            auto stream =
+                createContextStream(model_config, runtime_config, resource_context, std::vector<int>(7 + i, 5), 1);
+            stream->setScoreLen(3);
+            auto& config       = *stream->generateConfig();
+            config.top_k       = 1;
+            config.top_p       = 0.8f;
+            config.temperature = i % 3 == 0 ? 0.0f : (i % 3 == 1 ? 1.0f : 0.7f);
+            if (i % 4 == 3) {
+                config.do_sample = false;
+                config.top_k     = 50;  // Must retain the legacy no-sample normalization.
+            }
+            streams.push_back(stream);
+        }
+        StreamGroups groups(streams);
+        auto         logits = torch::full({batch * 3, padded_vocab_size}, -20.0f, torch::kFloat32);
+        for (int row = 0; row < batch * 3; ++row) {
+            // Include exact ties; synthetic TP-padding logits must be ignored.
+            logits[row][row % 11].fill_(4.0f);
+            logits[row][12].fill_(row % 2 == 0 ? 4.0f : 3.0f);
+        }
+        logits.narrow(1, vocab_size, padded_vocab_size - vocab_size).fill_(1000.0f);
+        GptModelOutputs model_output;
+        model_output.logits = logits.to(torch::kCUDA);
+        auto draft_ids      = torch::zeros({batch, 2}, model_output.logits.options().dtype(torch::kInt32));
+        auto legacy_inputs  = processor.gatherSpecSamplerInput(groups, model_output, {}, draft_ids);
+        ASSERT_TRUE(legacy_inputs.ok());
+
+        // A forbidden seqLength()/currentNumBeams()/completeTokenIds() read
+        // would dereference this missing worker-owned history. Restore even
+        // when an assertion or exception leaves the scope.
+        struct RestoreHistory {
+            std::vector<std::pair<GenerateStreamPtr, std::shared_ptr<CompleteTokenIds>>> saved;
+            ~RestoreHistory() {
+                for (auto& item : saved)
+                    item.first->complete_token_ids_ = std::move(item.second);
+            }
+        } restore;
+        for (auto& stream : streams) {
+            restore.saved.emplace_back(stream, std::exchange(stream->complete_token_ids_, nullptr));
+        }
+        ASSERT_TRUE(processor.canGatherStatelessGreedySpecSamplerInput(groups));
+        auto stateless_inputs = processor.gatherStatelessGreedySpecSamplerInput(groups, model_output);
+        ASSERT_TRUE(stateless_inputs.ok());
+        auto reference    = legacy_sampler.forward(legacy_inputs.value());
+        auto actual       = stateless_sampler.forward(stateless_inputs.value());
+        auto expected_ids = torch::arange(batch * 3, torch::kInt32).remainder(11).reshape({batch * 3, 1});
+        EXPECT_TRUE(torch::equal(actual.token_ids.cpu(), expected_ids));
+        // Keep at least as many vocabulary columns as score rows. Tiny-vocabulary
+        // temperature initialization is independent of the async sampling contract.
+        auto expected_logits = logits.narrow(1, 0, vocab_size).clone();
+        for (int row = 0; row < batch * 3; ++row) {
+            const float temperature = stateless_inputs->temperature.data_ptr<float>()[row];
+            expected_logits[row].mul_(1.0f / (temperature + 1e-6f));
+        }
+        EXPECT_TRUE(torch::allclose(stateless_inputs->logits.cpu(), expected_logits, 1e-6, 1e-6));
+        EXPECT_TRUE(torch::equal(reference.token_ids, actual.token_ids));
+        EXPECT_TRUE(torch::equal(reference.all_probs, actual.all_probs));
+        EXPECT_TRUE(torch::equal(reference.success, actual.success));
+        EXPECT_TRUE(torch::equal(legacy_inputs->logits, stateless_inputs->logits));
+
+        // Exercise full acceptance and rejection at each proposal position.
+        auto target_ids = reference.token_ids.reshape({batch, 3});
+        draft_ids.copy_(target_ids.narrow(1, 0, 2));
+        for (int row = 0; row < batch; ++row) {
+            if (row % 3 != 0)
+                draft_ids[row][row % 3 - 1].fill_(11);
+        }
+        SamplerOutput draft;
+        draft.token_ids = draft_ids;
+        draft.all_probs = torch::zeros({batch, 2, vocab_size}, model_output.logits.options());
+        draft.all_probs.scatter_(2, draft_ids.to(torch::kLong).unsqueeze(-1), 1.0);
+        reference.all_probs     = reference.all_probs.reshape({batch, 3, vocab_size});
+        actual.all_probs        = actual.all_probs.reshape({batch, 3, vocab_size});
+        auto expected_rejection = legacy_rejection.forward(streams, draft, reference);
+        auto actual_rejection   = stateless_rejection.forward(streams, draft, actual);
+        EXPECT_TRUE(torch::equal(expected_rejection.accept_len, actual_rejection.accept_len));
+        EXPECT_TRUE(torch::equal(expected_rejection.accept_tokens, actual_rejection.accept_tokens));
+    }
+}
+
+TEST_F(MtpBatchStreamProcessorTest, StatelessGreedyRejectsHistoryDependentAndOriginalProbabilityRequests) {
+    autil::EnvGuard compact_guard("RTP_LLM_MTP_COMPACT_GREEDY_HISTORY", "1");
+    ModelConfig     model_config;
+    model_config.max_seq_len        = 64;
+    model_config.vocab_size         = 13;
+    auto stream                     = createContextStream(model_config, RuntimeConfig{}, ResourceContext{}, {1, 2}, 1);
+    stream->generateConfig()->top_k = 1;
+    StreamGroups groups({stream});
+    auto         eligible = [&] { return MtpBatchStreamProcessor::canGatherStatelessGreedySpecSamplerInput(groups); };
+    ASSERT_TRUE(eligible());
+    auto original_config = *stream->generateConfig();
+    for (auto edit :
+         std::vector<std::function<void(GenerateConfig&)>>{[](auto& c) {
+                                                               c.top_k     = 5;
+                                                               c.do_sample = true;
+                                                           },
+                                                           [](auto& c) { c.repetition_penalty = 1.1f; },
+                                                           [](auto& c) { c.presence_penalty = 0.1f; },
+                                                           [](auto& c) { c.frequency_penalty = 0.1f; },
+                                                           [](auto& c) { c.no_repeat_ngram_size = 2; },
+                                                           [](auto& c) { c.num_beams = 2; },
+                                                           [](auto& c) { c.variable_num_beams = {1, 2}; },
+                                                           [](auto& c) { c.num_return_sequences = 2; },
+                                                           [](auto& c) { c.return_cum_log_probs = true; }}) {
+        edit(*stream->generateConfig());
+        EXPECT_FALSE(eligible());
+        *stream->generateConfig() = original_config;
+    }
+    stream->setReturnAllProbs(ReturnAllProbsMode::ORIGINAL);
+    EXPECT_FALSE(eligible());
+    stream->setReturnAllProbs(ReturnAllProbsMode::DEFAULT);
+    stream->logits_processor_list_.push_back(nullptr);  // Any registered processor forces the host path.
+    EXPECT_FALSE(eligible());
+    stream->logits_processor_list_.clear();
+    {
+        autil::EnvGuard disabled("RTP_LLM_MTP_COMPACT_GREEDY_HISTORY", "0");
+        EXPECT_FALSE(eligible());
+    }
+    EXPECT_TRUE(eligible());
+}
+#endif
 
 TEST_F(MtpBatchStreamProcessorTest, DISABLED_benchmarkScoreTokenIdsTorchCopyVsMemcpy) {
     constexpr int64_t stream_count = 64;
@@ -1599,6 +1746,61 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodeDraftModelInputAdvancesCombo
     EXPECT_EQ((vector<int>{6, 8}), toVec<int>(model_input.sequence_lengths));
     EXPECT_EQ((vector<float>{0.1, 0.2, 1.1, 1.2}), toVec<float>(model_input.last_hidden_states));
     EXPECT_EQ((vector<int>{6, 7, 8, 11, 12, 13}), toVec<int>(model_input.combo_position_ids));
+    EXPECT_TRUE(model_input.combo_position_ids.is_cpu());
+    EXPECT_TRUE(model_input.combo_position_ids.is_pinned());
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodeDraftModelInputKeepsDevicePositionIds) {
+    for (const int64_t position_factor : {1, 3}) {
+        SCOPED_TRACE(position_factor);
+        ModelConfig                 model_config;
+        PDSepConfig                 pd_sep_config;
+        ProfilingDebugLoggingConfig profiling_debug_logging_config;
+        CacheConfig                 cache_config = makeProcessorCacheConfig();
+        SpeculativeExecutionConfig  sp_config;
+        model_config.max_seq_len = 2048;
+        model_config.vocab_size  = 4;
+        model_config.num_layers  = 1;
+        if (position_factor == 3) {
+            model_config.mm_model_config.mm_position_ids_style = MROPE;
+        }
+        model_config.attn_config.rope_config.index_factor = position_factor;
+        sp_config.gen_num_per_cycle                       = 2;
+        MtpBatchStreamProcessor processor(
+            model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+
+        GptModelInputs model_input;
+        model_input.combo_tokens     = torch::tensor({11, 21}, torch::kInt32).to(torch::kCUDA);
+        model_input.sequence_lengths = torch::tensor({5, 7}, torch::kInt32).to(torch::kCUDA);
+        // Preserve distinct MRoPE axis offsets and exercise a noncontiguous
+        // device view. The source may still be referenced by prepared inputs.
+        auto positions = torch::arange(4 * position_factor, torch::kInt32).to(torch::kCUDA).reshape({-1, 2});
+        model_input.combo_position_ids = positions.select(1, 0);
+        const auto original_positions  = model_input.combo_position_ids;
+        ASSERT_FALSE(original_positions.is_contiguous());
+
+        GptModelOutputs model_output;
+        model_output.all_hidden_states =
+            torch::ones({2, 2}, torch::TensorOptions(torch::kFloat32).device(torch::kCUDA));
+        auto         draft_token_ids = torch::tensor({12, 22}, torch::kInt32).to(torch::kCUDA).reshape({2, 1});
+        TensorHolder holder;
+        processor.updateDecodeDraftModelInput(model_input, model_output, draft_token_ids, holder);
+
+        ASSERT_TRUE(model_input.combo_position_ids.is_cuda());
+        EXPECT_EQ(torch::kInt32, model_input.combo_position_ids.scalar_type());
+        EXPECT_EQ(1, model_input.combo_position_ids.dim());
+        EXPECT_EQ(2 * position_factor, model_input.combo_position_ids.numel());
+        EXPECT_TRUE(model_input.combo_position_ids.is_contiguous());
+        vector<int> expected_positions;
+        vector<int> expected_original;
+        for (int64_t i = 0; i < 2 * position_factor; ++i) {
+            expected_positions.push_back(2 * i + 1);
+            expected_original.push_back(2 * i);
+        }
+        EXPECT_EQ(expected_positions, toVec<int>(model_input.combo_position_ids));
+        EXPECT_EQ(expected_original, toVec<int>(original_positions));
+        EXPECT_EQ((vector<int>{6, 8}), toVec<int>(model_input.sequence_lengths));
+    }
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testExpandTargetVerifyPositionIdsInitializesNonDriverPlaceholder) {

@@ -13,6 +13,7 @@
 #include <string>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -87,6 +88,8 @@ public:
     GptModelOutputs            forward(const GptModelInputs& inputs) override;
     GptModelOutputs            forwardMicroBatched(const GptModelInputs& inputs, bool capture_hidden_states);
     void                       releaseBuffers() override;
+    bool                       canRetireDecodeBuffers() const override;
+    std::shared_ptr<void>      retainDecodeBuffers(const std::shared_ptr<torch::Event>& completion) override;
     torch::Tensor              getMtpTargetHiddenStates(int64_t num_tokens) override;
     torch::Tensor              getMtpLastHiddenStates(int64_t num_tokens) override;
     bool                       hasMtpTargetHiddenBuffer() const override;
@@ -110,6 +113,7 @@ private:
 private:
     // Helper functions to reduce code duplication
     torch_ext::PyAttentionInputs  buildPyAttentionInputs(const GptModelInputs& inputs);
+    void                          materializeHostAttentionInputs(torch_ext::PyModelInputs& inputs);
     torch_ext::PyEmbeddingInputs  buildPyEmbeddingInputs(const GptModelInputs& inputs);
     torch_ext::PyMultimodalInputs buildPyMultimodalInputs(const GptModelInputs& inputs);
     torch_ext::BertEmbeddingInputs
@@ -153,6 +157,7 @@ private:
     GraphBase*      selectGraphRunner(const torch_ext::PyAttentionInputs& attention_inputs) const;
     CudaGraphState& selectGraphState(const torch_ext::PyAttentionInputs& attention_inputs);
     void            cleanupAfterConstructionFailure() noexcept;
+    void            waitRetiredDecode();
 
     // Member variables (formerly inherited from GptModel)
     const rtp_llm::ExecProperties                   device_props_;
@@ -178,6 +183,13 @@ private:
     // the normal main-generation wrapper can own this secondary runner.
     const bool                       owns_generation_prefill_cuda_graph_{false};
     bool                             enable_cuda_graph_{false};
+    bool                             device_attention_metadata_{false};
+    bool                             retain_decode_buffers_{false};
+    bool                             last_forward_device_graph_{false};
+    size_t                           decode_prepare_count_{0};
+    size_t                           decode_forward_count_{0};
+    std::vector<GptModelInputs>      decode_retained_inputs_;
+    std::shared_ptr<torch::Event>    retired_decode_completion_;
     bool                             is_prefill_cuda_graph_mode_{false};
     GenerationPrefillCudaGraphStatus generation_prefill_cuda_graph_init_status_{
         GenerationPrefillCudaGraphStatus::NOT_REQUESTED};
@@ -361,6 +373,12 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     py::object py_init_result;
     // Always initialize py_model_ so it can be used as fallback when CUDA graph cannot run
     py_model_                 = py_instance;
+    const char* device_metadata_env = std::getenv("RTP_LLM_DEVICE_ATTENTION_METADATA");
+    const char* retire_env          = std::getenv("RTP_LLM_ASYNC_DECODE_RETIREMENT");
+    retain_decode_buffers_          = retire_env && std::string(retire_env) == "1";
+    device_attention_metadata_ =
+        enable_cuda_graph_ && device_metadata_env && std::string(device_metadata_env) == "1"
+        && py::getattr(py_model_, "supports_device_attention_metadata", py::bool_(false)).cast<bool>();
     supports_micro_batch_     = py::hasattr(py_model_, "forward_micro_batch");
     // MtpExecutor passes use_spec_decoding only to its target wrapper. The
     // normal and draft wrappers may share the same Python class, but must not

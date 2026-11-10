@@ -195,6 +195,9 @@ cc_library(
             "//rtp_llm/models_py/bindings/cuda:bf16_gemm_op",
             "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
         ],
+        "//:using_rocm": [
+            "//rtp_llm/models_py/bindings/cuda/kernels:attention_input_metadata",
+        ],
         "//conditions:default": [],
     }),
     visibility = ["//visibility:public"],

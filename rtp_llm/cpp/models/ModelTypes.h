@@ -209,6 +209,15 @@ public:
     virtual ~ModelBase()                                                     = default;
     virtual GptModelOutputs            forward(const GptModelInputs& inputs) = 0;
     virtual void                       releaseBuffers() {}
+    // Opt-in only: the caller records completion after all model GPU work and
+    // retains this owner until that event completes. Unsupported models keep
+    // the synchronous phase-boundary release path.
+    virtual bool canRetireDecodeBuffers() const {
+        return false;
+    }
+    virtual std::shared_ptr<void> retainDecodeBuffers(const std::shared_ptr<torch::Event>& completion) {
+        return {};
+    }
     virtual void                       prepareAttentionInputs(const GptModelInputs& inputs) {}
     virtual std::optional<std::string> takeDeferredHiddenStateCaptureError() {
         return std::nullopt;

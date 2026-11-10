@@ -1191,6 +1191,9 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         executor_collector.tp_sync_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
 
+    // Empty prefill steps occur on every decode iteration. Drain only after
+    // TP agreed that a real prefill will use the model's eager state.
+    retired_decode_buffers_.drain();
     beginProfiledWork();
     metrics_collector.not_skip = true;
 
@@ -1542,6 +1545,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     bool                          prev_bookkeeping_synced_for_spec_logits = false;
     bool                          spec_logits_async_launched              = false;
     bool                          spec_logits_processor_present           = false;
+    bool                          defer_bookkeeping_until_dispatch        = false;
     const bool                    alignment_only                          = enable_ffn_disaggregate_ && streams.empty();
 
     // StreamGroups snapshots scheduling metadata. Wait for any mutable
@@ -1582,6 +1586,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         if (model_input.skip_run) {
             return absl::OkStatus();
         }
+        retired_decode_buffers_.drain();
         releaseAllModelBuffers();
         return runDecodeAlignmentOnly(model_input);
     }
@@ -1824,6 +1829,30 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     SamplerOutput sampler_output;
     auto          run_sampling_and_cap = [&]() -> absl::Status {
+        if (isTpRank0() && !model_input.is_fake_stream && !is_dspark_ && useStreamAsync() && useDropBroadSync()) {
+            // dispatchDecodeAsync publishes device snapshots in ordinary
+            // STREAM_ASYNC mode too; the explicit MTP_ASYNC_DEVICE_STATE
+            // override is not required. Inspect the published tensors here.
+            const bool device_probs_ready =
+                std::all_of(streams.begin(), streams.end(), [](const GenerateStreamPtr& stream) {
+                    const auto probs = stream->getDraftAllProbsGpu();
+                    return probs.defined() && probs.is_cuda();
+                });
+            if (!device_probs_ready && !prev_bookkeeping_synced_for_spec_logits) {
+                RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(wait_prev_bookkeeping_draft_probs_fallback)");
+                spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+                stream_groups                           = StreamGroups(streams);
+                prev_bookkeeping_synced_for_spec_logits = true;
+            }
+            static const bool stateless_enabled =
+                readEnvFlagOnce("RTP_LLM_ASYNC_STATELESS_GREEDY", "async-stateless-greedy", "enabled");
+            defer_bookkeeping_until_dispatch =
+                stateless_enabled && device_probs_ready && !warm_up_ && !model_input.pd_separation
+                && !enable_ffn_disaggregate_ && !parallelism_config_.prefill_cp_config.is_enabled()
+                && parallelism_config_.tp_size == 2 && parallelism_config_.dp_size == 1 && propose_step_ == 2
+                && useDeviceInput() && !spec_logits_processor_present && !prev_bookkeeping_synced_for_spec_logits
+                && MtpBatchStreamProcessor::canGatherStatelessGreedySpecSamplerInput(stream_groups);
+        }
         // trick: update draft sampler output after spec decode to avoid kernel launch overhead
         if (isTpRank0()) {
             RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(update_draft_sampler_output)");
@@ -1887,7 +1916,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 // gatherSpecSamplerInput reads host stream state updated by the previous
                 // bookkeeping worker. DROP_BROAD_SYNC therefore needs this narrow sync
                 // unless an earlier spec-logits narrow sync already waited.
-                if (useStreamAsync() && useDropBroadSync() && !prev_bookkeeping_synced_for_spec_logits) {
+                if (useStreamAsync() && useDropBroadSync() && !prev_bookkeeping_synced_for_spec_logits
+                    && !defer_bookkeeping_until_dispatch) {
                     RTP_LLM_PROFILE_SCOPE_DYNAMIC(
                         "executor.mtp.decode_step(wait_prev_bookkeeping_pre_sampler,stream_count=%zu)", streams.size());
                     spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
@@ -1897,8 +1927,11 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 }
 
                 // target model sample
-                auto sampler_input_status = batch_stream_processor_->gatherSpecSamplerInput(
-                    stream_groups, model_output, *spec_logits_result, draft_sampler_output.token_ids);
+                auto sampler_input_status =
+                    defer_bookkeeping_until_dispatch ?
+                                 batch_stream_processor_->gatherStatelessGreedySpecSamplerInput(stream_groups, model_output) :
+                                 batch_stream_processor_->gatherSpecSamplerInput(
+                            stream_groups, model_output, *spec_logits_result, draft_sampler_output.token_ids);
                 if (!sampler_input_status.ok()) {
                     return sampler_input_status.status();
                 }
@@ -2011,8 +2044,12 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         model_forward_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
 
+    if (!isTpRank0() && tryRetireNonRootDecode(model_input, model_output, draft_prefill_model_output)) {
+        return absl::OkStatus();
+    }
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
         cudaSyncAndCheck();
+        retired_decode_buffers_.reap();
         releaseAllModelBuffers();
         return absl::OkStatus();
     }
@@ -2036,6 +2073,27 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     if (useStreamAsync()) {
         draft_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
         draft_event->record(cuda_graph::graphGetCurrentStream());
+    }
+
+    if (defer_bookkeeping_until_dispatch) {
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(wait_prev_bookkeeping_post_submit,stream_count=%zu)",
+                                      streams.size());
+        // All GPU work for this round is queued. Join before reading host
+        // metrics or publishing the next device-state epoch: the previous
+        // worker still consumes the previous epoch's hidden-state snapshot.
+        try {
+            spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+            stream_groups = StreamGroups(streams);
+        } catch (const std::exception& e) {
+            // Target side state has committed, and other TP ranks may already
+            // have returned. Neither rollback nor a root-only collective is
+            // safe here. Fail-stop instead of leaving peers in the next round.
+            RTP_LLM_LOG_ERROR("MTP bookkeeping failed after target commit: %s; terminating TP execution", e.what());
+            std::terminate();
+        } catch (...) {
+            RTP_LLM_LOG_ERROR("MTP bookkeeping failed after target commit; terminating TP execution");
+            std::terminate();
+        }
     }
 
     if (metrics_reporter_) {
@@ -2831,7 +2889,88 @@ absl::Status MtpExecutor::dispatchDecodeOutput(const StreamGroups&              
     return result;
 }
 
+bool MtpExecutor::tryRetireNonRootDecode(const GptModelInputs&  inputs,
+                                         const GptModelOutputs& target_output,
+                                         const GptModelOutputs& draft_output) {
+    static const bool enabled = readEnvFlagOnce("RTP_LLM_ASYNC_DECODE_RETIREMENT", "async-retirement", "enabled");
+    if (!enabled || isTpRank0() || warm_up_ || inputs.warmup || inputs.is_fake_stream || inputs.pd_separation
+        || is_dspark_ || enable_ffn_disaggregate_ || parallelism_config_.prefill_cp_config.is_enabled()
+        || parallelism_config_.tp_size != 2 || parallelism_config_.dp_size != 1 || propose_step_ != 2
+        || !useStreamAsync() || !useDropBroadSync() || !useDeviceInput() || !speculativeTargetTransactionsEnabled()
+        || !draft_model_ || !sp_prefill_draft_model_ || draft_model_.get() == sp_prefill_draft_model_.get()
+        || !model_->canRetireDecodeBuffers() || !draft_model_->canRetireDecodeBuffers()
+        || !sp_prefill_draft_model_->canRetireDecodeBuffers()) {
+        return false;
+    }
+    RTP_LLM_PROFILE_SCOPE("executor.mtp.retire_nonroot_decode");
+    struct Round {
+        GptModelInputs                     inputs;
+        GptModelOutputs                    target_output;
+        GptModelOutputs                    draft_output;
+        std::vector<std::shared_ptr<void>> models;
+        std::vector<torch::Tensor>         staging;
+    };
+    auto owner           = std::make_shared<Round>();
+    owner->inputs        = inputs;
+    owner->target_output = target_output;
+    owner->draft_output  = draft_output;
+    owner->models.reserve(3);
+    auto completion = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    // Both prepare workers have joined the main stream before this point.
+    // Record after draft-prefill post layers and target side-state commit.
+    retired_decode_stream_ = cuda_graph::graphGetCurrentStream();
+    completion->record(*retired_decode_stream_);
+    try {
+        for (auto* model : {model_.get(), draft_model_.get(), sp_prefill_draft_model_.get()}) {
+            owner->models.push_back(model->retainDecodeBuffers(completion));
+        }
+        owner->staging = buffer_holder_.takeAll();
+        retired_decode_buffers_.retire(completion, owner);
+    } catch (...) {
+        // Keep partial ownership transfers alive until their GPU readers finish.
+        try {
+            completion->synchronize();
+        } catch (...) {
+            std::terminate();
+        }
+        throw;
+    }
+    return true;
+}
+
+void MtpExecutor::drainRetiredDecodeOnExit() noexcept {
+    if (!retired_decode_stream_) {
+        return;
+    }
+    // Join host submission before draining the stream: an event alone cannot
+    // cover work a still-running prepare thread has yet to enqueue.
+    try {
+        for (auto* runner : {&target_verify_prepare_runner_,
+                             &draft_prefill_prepare_runner_,
+                             &spec_logits_verify_async_runner_,
+                             &spec_bookkeeping_runner_}) {
+            try {
+                runner->sync(*retired_decode_stream_);
+            } catch (...) {
+                // AsyncRunner drains its GPU stream before publishing failure.
+                // Continue joining the other workers, preserving the original
+                // process exception rather than throwing during stack unwind.
+            }
+        }
+        retired_decode_stream_->synchronize();
+        retired_decode_buffers_.drain();
+    } catch (...) {
+        RTP_LLM_LOG_ERROR("MTP async decode retirement drain failed; storage cannot be safely released");
+        std::terminate();
+    }
+}
+
+MtpExecutor::~MtpExecutor() {
+    drainRetiredDecodeOnExit();
+}
+
 void MtpExecutor::releaseAllModelBuffers() {
+    retired_decode_buffers_.reap();
     // TensorHolder release point (MtpExecutor phase boundary): after the current
     // TP sync/model-input preparation has consumed staged H2D sources, advance
     // the hold window for executor-owned model/sampler staging tensors.
@@ -2938,6 +3077,15 @@ void MtpExecutor::beginProfiledWork() {
 }
 
 absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, int64_t schedule_time_us) {
+    struct RetirementFailureGuard {
+        MtpExecutor* executor;
+        int          exceptions = std::uncaught_exceptions();
+        ~RetirementFailureGuard() {
+            if (std::uncaught_exceptions() > exceptions) {
+                executor->drainRetiredDecodeOnExit();
+            }
+        }
+    } retirement_failure_guard{this};
     // Start only after TP has agreed that this step has model work. Rank 1 may
     // already be waiting in an idle broadcast when the profile RPC arrives.
     // Counting that wait as a step shifts its window relative to rank 0.

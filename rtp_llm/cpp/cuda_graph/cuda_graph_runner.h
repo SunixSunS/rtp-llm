@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <exception>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -96,6 +97,11 @@ public:
                                       || role_ == CudaGraphRole::MTP_DRAFT_PREFILL
                                       || role_ == CudaGraphRole::GENERATION_PREFILL;
         is_target_verify_ = role_ == CudaGraphRole::TARGET_VERIFY;
+        const char* device_metadata_env = std::getenv("RTP_LLM_DEVICE_ATTENTION_METADATA");
+        device_attention_metadata_ =
+            device_metadata_env && std::string(device_metadata_env) == "1" && role_ != CudaGraphRole::GENERATION_PREFILL
+            && role_ != CudaGraphRole::EMBEDDING_PREFILL
+            && py::getattr(py_instance_, "supports_device_attention_metadata", py::bool_(false)).cast<bool>();
         RTP_LLM_CHECK_WITH_INFO(num_tokens_per_bs_ > 0, "CUDA graph tokens per request must be positive");
         draft_prefill_uses_request_lanes_ =
             isMtpDraftPrefillCudaGraph() && py::hasattr(py_instance_, "cuda_graph_draft_prefill_uses_request_lanes")
@@ -239,6 +245,7 @@ private:
     py::object              py_forward_method_;
     py::object              py_attn_pyobj_method_;
     bool                    prepare_model_inputs_enabled_{false};
+    bool                    device_attention_metadata_{false};
     bool                    enable_cuda_graph_{false};
     bool                    is_prefill_cuda_graph_mode_{false};
     bool                    is_target_verify_{false};
