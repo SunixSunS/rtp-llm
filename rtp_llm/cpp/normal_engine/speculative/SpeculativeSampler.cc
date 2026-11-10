@@ -1,6 +1,15 @@
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <string>
 #include <vector>
+#if USING_ROCM
+#include <pybind11/pybind11.h>
+#endif
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/cpp/utils/DebugUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -24,6 +33,56 @@ FastTopKSamplerOutput FastTopKSampler::forward(const torch::Tensor& logits, int 
     execMappingDraft2Target({output.token_ids, d2t_map_, batch_size, 0, 1});
 
     return output;
+}
+
+FastTopKSamplerOutput FastTopKSampler::forwardTail(const torch::Tensor& logits) {
+#if USING_ROCM
+    static const bool use_split_top1 = [] {
+        const char* value = std::getenv("RTP_LLM_MTP_TAIL_SPLIT_TOP1");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    // Only use AITER's split reduction. Its single-pass launcher caches the
+    // first compiled tensor layout; a width-one first call can specialize the
+    // row stride to one and corrupt later multi-row inputs. The pinned AITER
+    // split rule uses >16384 columns and more than one workgroup per row for
+    // batches below 1024. All other shapes keep the original sampler path.
+    if (use_split_top1 && logits.defined() && logits.is_cuda() && logits.scalar_type() == torch::kFloat32
+        && logits.dim() == 2 && logits.is_contiguous() && logits.numel() > 0 && logits.stride(1) == 1
+        && logits.stride(0) == logits.size(1) && logits.size(0) < 1024 && logits.size(1) > 16384
+        && logits.numel() <= std::numeric_limits<int32_t>::max()) {
+        RTP_LLM_PROFILE_SCOPE("speculative_sampler.forward_tail(aiter_split_top1)");
+        torch::Tensor token_ids;
+        {
+            // Import uses Python's module cache. Keep every Python reference
+            // inside the GIL scope instead of a static with teardown ordering.
+            pybind11::gil_scoped_acquire gil;
+            try {
+                pybind11::object topk_select = pybind11::module_::import("aiter.ops.topk_select").attr("topk_select");
+                auto             result =
+                    topk_select(logits, 1, pybind11::arg("tie") = "low", pybind11::arg("return_value") = false)
+                        .cast<pybind11::tuple>();
+                TORCH_CHECK(result.size() == 2, "AITER topk_select must return (values, indices)");
+                token_ids = result[1].cast<torch::Tensor>();
+            } catch (const std::exception& error) {
+                throw std::runtime_error(std::string("FastTopKSampler::forwardTail AITER split-top1 failed: ")
+                                         + error.what());
+            }
+        }
+        TORCH_CHECK(token_ids.defined() && token_ids.is_cuda() && token_ids.device() == logits.device()
+                        && token_ids.scalar_type() == torch::kInt32 && token_ids.dim() == 2
+                        && token_ids.size(0) == logits.size(0) && token_ids.size(1) == 1 && token_ids.is_contiguous(),
+                    "FastTopKSampler::forwardTail AITER split-top1 must return contiguous int32 [B,1] on the logits "
+                    "device");
+        FastTopKSamplerOutput output;
+        output.token_ids = token_ids.to(torch::kLong);
+        // Scatter uses draft-vocabulary indices. As in forward(), apply d2t
+        // only after constructing independently owned one-hot probabilities.
+        output.all_probs = torch::zeros_like(logits).scatter_(-1, output.token_ids, 1.0);
+        execMappingDraft2Target({output.token_ids, d2t_map_, static_cast<int>(output.token_ids.size(0)), 0, 1});
+        return output;
+    }
+#endif
+    return forward(logits);
 }
 
 SamplerOutput SpeculativeSampler::sampleDSparkDraft(const torch::Tensor& base_logits,

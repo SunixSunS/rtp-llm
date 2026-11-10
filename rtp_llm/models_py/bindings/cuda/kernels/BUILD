@@ -207,6 +207,60 @@ cc_test_wrapper(
     tags = ["L20_CU13", "MI308X-ROCM7"],
 )
 
+cc_library(
+    name = "mtp_cache_table_advance",
+    srcs = ["mtp_cache_table_advance.cu"],
+    hdrs = ["mtp_cache_table_advance.h"],
+    deps = torch_deps() + select({
+        "@//:using_cuda": [
+            "@local_config_cuda//cuda:cuda_headers",
+            "@local_config_cuda//cuda:cudart",
+        ],
+        "@//:using_rocm": [
+            "@local_config_rocm//rocm:rocm_headers",
+            "@local_config_rocm//rocm:hip",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = any_cuda_copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_test_wrapper(
+    name = "mtp_cache_table_advance_test",
+    srcs = ["mtp_cache_table_advance_test.cc"],
+    copts = copts(),
+    deps = [
+        ":mtp_cache_table_advance",
+        "//rtp_llm/cpp/utils:linear_blocks_util",
+        "@com_google_googletest//:gtest_main",
+    ] + torch_deps() + select({
+        "@//:using_cuda": [
+            "@local_config_cuda//cuda:cuda_headers",
+            "@local_config_cuda//cuda:cudart",
+        ],
+        "@//:using_rocm": [
+            "@local_config_rocm//rocm:rocm_headers",
+            "@local_config_rocm//rocm:hip",
+        ],
+        "//conditions:default": [],
+    }),
+    env = select({
+        "@//:using_rocm": {"TEST_USING_DEVICE": "ROCM"},
+        "//conditions:default": {"TEST_USING_DEVICE": "CUDA"},
+    }),
+    exec_properties = select({
+        "@//:using_rocm": {"gpu": "MI308X-ROCM7"},
+        "//conditions:default": {"gpu": "L20_CU13"},
+    }),
+    target_compatible_with = select({
+        "@//:using_cuda": [],
+        "@//:using_rocm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    tags = ["L20_CU13", "MI308X-ROCM7"],
+)
+
 # Vendored from vLLM (csrc/persistent_topk.cuh + csrc/topk.cu @ b55d830).
 # Replaces torch.topk on the DSv4 indexer decode hot path:
 #   K=512 / T_max=2048: torch.topk ~30us → this kernel ~5-10us.

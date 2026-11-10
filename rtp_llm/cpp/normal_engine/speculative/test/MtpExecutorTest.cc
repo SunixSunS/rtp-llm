@@ -1,9 +1,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <functional>
+#include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -19,6 +22,7 @@
 #include "rtp_llm/cpp/models/context_parallel/ZigzagProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/SpecLogitsProcessor.h"
 #include "rtp_llm/cpp/normal_engine/HiddenStateCapturePolicy.h"
+#include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 
 #define private public
 #include "rtp_llm/cpp/normal_engine/speculative/MtpBatchStreamProcessor.h"
@@ -1725,6 +1729,173 @@ TEST_F(MtpExecutorTest, testHiddenStateCapturePolicy) {
                     HiddenStateCaptureModelRole::DRAFT, RoleType::PREFILL, false, configured_layer_ids)
                     .empty());
 }
+
+TEST_F(MtpExecutorTest, SamplerMetricsReusePreservesCountsPrioritiesAndCopyLifetime) {
+    MtpExecutorTestConfig config;
+    config.gen_num_per_cycle = 2;
+    auto       components    = createMtpExecutorComponents(config);
+    auto&      executor      = *components.executor;
+    const auto pinned_i32    = torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true);
+    for (const std::vector<int32_t>& values : {std::vector<int32_t>{1, 2, 3, 1}, {3}, {2, 1, 1, 2, 3}}) {
+        auto source_cpu  = torch::tensor(values, pinned_i32);
+        auto source_gpu  = source_cpu.to(torch::kCUDA, /*non_blocking=*/true);
+        auto copied_rows = torch::empty({static_cast<int64_t>(values.size())}, pinned_i32);
+        copied_rows.copy_(source_gpu, /*non_blocking=*/true);
+        auto copied_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+        copied_event->record(cuda_graph::graphGetCurrentStream());
+        auto                       unused_event = cuda_graph::makeGraphEvent();
+        std::vector<int32_t>       priorities;
+        std::map<int32_t, int64_t> expected_by_priority;
+        int64_t                    expected_total = 0;
+        for (size_t row = 0; row < values.size(); ++row) {
+            priorities.push_back(row % 2 == 0 ? 7 : 11);
+            expected_by_priority[priorities.back()] += values[row];
+            expected_total += values[row];
+        }
+        executor.stageAcceptLenMetrics(source_gpu, unused_event, values.size(), priorities, copied_rows, copied_event);
+        EXPECT_EQ(executor.metrics_accept_len_rows_cpu_.data_ptr(), copied_rows.data_ptr());
+        EXPECT_EQ(executor.metrics_accept_len_rows_gpu_.data_ptr(), source_gpu.data_ptr());
+        EXPECT_FALSE(executor.metrics_accept_len_sum_gpu_.defined());
+        EXPECT_FALSE(executor.metrics_accept_len_sum_cpu_.defined());
+        // Drop producer-side ownership before consuming the asynchronous copy.
+        copied_rows = torch::Tensor();
+        source_gpu  = torch::Tensor();
+        copied_event.reset();
+        const auto actual = executor.consumePendingAcceptLenMetrics();
+        ASSERT_TRUE(actual.valid);
+        EXPECT_EQ(actual.total_accept_len, expected_total);
+        EXPECT_EQ(actual.total_stream_num, values.size());
+        EXPECT_EQ(actual.total_propose_token_num, values.size() * 2);
+        for (const auto& entry : expected_by_priority) {
+            EXPECT_EQ(actual.accept_len_by_priority.at(entry.first), entry.second);
+        }
+        EXPECT_EQ(actual.accept_len_by_priority.size(), expected_by_priority.size());
+        EXPECT_FALSE(executor.metrics_accept_len_rows_gpu_.defined());
+        EXPECT_FALSE(executor.consumePendingAcceptLenMetrics().valid);
+
+        // The existing dedicated-metrics-stream path must keep the same counts
+        // when an unsupported request follows a sampler-copy request.
+        auto legacy_gpu   = source_cpu.to(torch::kCUDA, /*non_blocking=*/true);
+        auto legacy_ready = cuda_graph::makeGraphEvent();
+        legacy_ready.record(cuda_graph::graphGetCurrentStream());
+        executor.stageAcceptLenMetrics(legacy_gpu, legacy_ready, values.size(), priorities);
+        const auto legacy = executor.consumePendingAcceptLenMetrics();
+        ASSERT_TRUE(legacy.valid);
+        EXPECT_EQ(legacy.total_accept_len, actual.total_accept_len);
+        EXPECT_EQ(legacy.total_stream_num, actual.total_stream_num);
+        EXPECT_EQ(legacy.total_propose_token_num, actual.total_propose_token_num);
+        EXPECT_EQ(legacy.accept_len_by_priority, actual.accept_len_by_priority);
+    }
+}
+
+#if USING_ROCM
+TEST_F(MtpExecutorTest, SamplerMetricsReuseWaitsForBlockedCopyEvent) {
+    MtpExecutorTestConfig config;
+    config.gen_num_per_cycle = 2;
+    auto       components    = createMtpExecutorComponents(config);
+    auto&      executor      = *components.executor;
+    const auto pinned_i32    = torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true);
+    auto       source_cpu    = torch::tensor({1, 2, 1, 3}, pinned_i32);
+    auto       source_gpu    = torch::empty({4}, pinned_i32.pinned_memory(false).device(torch::kCUDA));
+    auto       copied_rows   = torch::full({4}, -777, pinned_i32);
+    auto       copied_event  = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    auto       unused_event  = cuda_graph::makeGraphEvent();
+
+    // This stream belongs to the test and cannot make progress past its host
+    // callback until the observer has tried to consume the still-pending copy.
+    struct GatedCopyStream {
+        cuda_graph::GraphStream stream = cuda_graph::graphGetStreamFromPool(true);
+        std::mutex              mutex;
+        std::condition_variable cv;
+        std::promise<void>      entered;
+        bool                    released = false;
+
+        static void wait(void* data) {
+            auto&                        gate = *static_cast<GatedCopyStream*>(data);
+            std::unique_lock<std::mutex> lock(gate.mutex);
+            gate.entered.set_value();
+            gate.cv.wait(lock, [&gate] { return gate.released; });
+        }
+        void release() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                released = true;
+            }
+            cv.notify_one();
+        }
+        ~GatedCopyStream() {
+            release();
+            // Declared after the copy endpoints, so even assertion/exception
+            // exits drain before those allocations or this callback disappear.
+            try {
+                stream.synchronize();
+            } catch (...) {
+                std::terminate();
+            }
+        }
+    } gate;
+    auto entered = gate.entered.get_future();
+
+    // A logits-processor cap records the sampler's event again after replacing
+    // its CPU mirror. Verify that the latest record, not its completed predecessor,
+    // protects the rows passed to metrics.
+    copied_event->record(gate.stream);
+    copied_event->synchronize();
+    ASSERT_EQ(hipLaunchHostFunc(gate.stream.stream(), &GatedCopyStream::wait, &gate), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(source_gpu.data_ptr<int32_t>(),
+                             source_cpu.data_ptr<int32_t>(),
+                             4 * sizeof(int32_t),
+                             hipMemcpyHostToDevice,
+                             gate.stream.stream()),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(copied_rows.data_ptr<int32_t>(),
+                             source_gpu.data_ptr<int32_t>(),
+                             4 * sizeof(int32_t),
+                             hipMemcpyDeviceToHost,
+                             gate.stream.stream()),
+              hipSuccess);
+    copied_event->record(gate.stream);
+    ASSERT_EQ(entered.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    ASSERT_FALSE(copied_event->query());
+    for (int row = 0; row < 4; ++row) {
+        EXPECT_EQ(copied_rows.data_ptr<int32_t>()[row], -777);
+    }
+
+    executor.stageAcceptLenMetrics(source_gpu, unused_event, 4, {7, 11, 7, 11}, copied_rows, copied_event);
+    copied_rows = torch::Tensor();
+    source_gpu  = torch::Tensor();
+    copied_event.reset();
+
+    std::promise<void> observer_started;
+    auto               started  = observer_started.get_future();
+    auto               consumed = std::async(std::launch::async, [&] {
+        try {
+            cuda_graph::setDevice(static_cast<int>(gate.stream.device_index()));
+        } catch (...) {
+            observer_started.set_exception(std::current_exception());
+            throw;
+        }
+        observer_started.set_value();
+        return executor.consumePendingAcceptLenMetrics();
+    });
+    // Declared after the future, so assertion/exception cleanup releases the
+    // callback before the future's destructor waits for the observer to exit.
+    auto release_before_join = std::shared_ptr<void>(nullptr, [&gate](void*) { gate.release(); });
+    ASSERT_EQ(started.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    ASSERT_NO_THROW(started.get());
+    EXPECT_EQ(consumed.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    gate.release();
+    const auto actual = consumed.get();
+    ASSERT_TRUE(actual.valid);
+    EXPECT_EQ(actual.total_accept_len, 7);
+    EXPECT_EQ(actual.total_stream_num, 4);
+    EXPECT_EQ(actual.total_propose_token_num, 8);
+    EXPECT_EQ(actual.accept_len_by_priority.at(7), 2);
+    EXPECT_EQ(actual.accept_len_by_priority.at(11), 5);
+    EXPECT_EQ(actual.accept_len_by_priority.size(), 2);
+    EXPECT_FALSE(executor.consumePendingAcceptLenMetrics().valid);
+}
+#endif
 
 TEST_F(MtpExecutorTest, testTargetOnlyPrefillCollectsContextTokenAndTpsMetrics) {
     MtpExecutorTestConfig test_config;

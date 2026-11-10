@@ -203,10 +203,12 @@ protected:
     void checkModelInputsOnCuda(const GptModelInputs& model_input, const char* tag) const;
 
     AcceptLenMetricsSnapshot consumePendingAcceptLenMetrics();
-    void                     stageAcceptLenMetrics(const torch::Tensor& accept_len,
-                                                   torch::Event&        accept_len_ready_event,
-                                                   size_t               stream_count,
-                                                   std::vector<int32_t> row_priorities);
+    void                     stageAcceptLenMetrics(const torch::Tensor&          accept_len,
+                                                   torch::Event&                 accept_len_ready_event,
+                                                   size_t                        stream_count,
+                                                   std::vector<int32_t>          row_priorities,
+                                                   const torch::Tensor&          sampler_rows_cpu   = {},
+                                                   std::shared_ptr<torch::Event> sampler_rows_ready = nullptr);
 
     void prepareStreams(const std::list<GenerateStreamPtr>& streams,
                         std::list<GenerateStreamPtr>&       prefill_streams,

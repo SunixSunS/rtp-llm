@@ -7,6 +7,9 @@
 #include "rtp_llm/cpp/utils/StringUtil.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#if USING_ROCM
+#include "rtp_llm/models_py/bindings/cuda/kernels/mtp_cache_table_advance.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -251,6 +254,29 @@ torch::Tensor MtpBatchStreamProcessor::advanceLinearCacheBlockTable(const torch:
         return current_table.clone();
     }
 
+#if USING_ROCM
+    const char* fused_env = std::getenv("RTP_LLM_MTP_FUSED_CACHE_TABLE");
+    if (fused_env != nullptr && std::strcmp(fused_env, "1") == 0 && group_count <= 64 && current_table.is_contiguous()
+        && previous_seq_lengths.is_contiguous() && accept_lengths.is_contiguous()) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.advance_linear_cache_block_table(fused)");
+        uint64_t linear_group_mask = 0;
+        for (int64_t group = 0; group < group_count; ++group) {
+            if (group_types[static_cast<size_t>(group)] == CacheGroupType::LINEAR) {
+                linear_group_mask |= uint64_t{1} << group;
+            }
+        }
+        auto next_table = torch::empty_like(current_table);
+        invokeMtpCacheTableAdvance(current_table,
+                                   previous_seq_lengths,
+                                   accept_lengths,
+                                   linear_group_mask,
+                                   seq_size_per_block,
+                                   next_table,
+                                   cuda_graph::graphGetCurrentStream().stream());
+        return next_table;
+    }
+#endif
+
     // Build one permutation per request, then apply it to every LINEAR group.
     // This is the vectorized form of LinearBlocksUtil.h's two sequential
     // swaps.  The scheduler's reserve_step contract guarantees active source
@@ -454,6 +480,15 @@ bool useMtpDeviceState() {
     const char* device_state = std::getenv("RTP_LLM_MTP_ASYNC_DEVICE_STATE");
     return (stream_async != nullptr && std::string(stream_async) == "1")
            || (device_state != nullptr && std::string(device_state) == "1");
+}
+
+bool useCompactMtpTail() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_COMPACT_TAIL");
+        return env != nullptr && std::strcmp(env, "1") == 0;
+    }();
+    const char* stream_async = std::getenv("RTP_LLM_STREAM_ASYNC");
+    return enabled && useMtpDeviceInput() && stream_async != nullptr && std::strcmp(stream_async, "1") == 0;
 }
 
 torch::Tensor emptyInt32OnPreferredDevice(std::initializer_list<int64_t> shape) {
@@ -917,6 +952,36 @@ void MtpBatchStreamProcessor::overlayMtpCacheSnapshots(const StreamGroups& strea
         "MTP cache snapshot overlay requires physical and kernel CUDA int32 destinations "
         "[group,batch,blocks]");
 
+    if (useCompactMtpTail() && !is_dspark_ && stream_groups.totalContextBatchSize() == 0 && buckets.size() == 1) {
+        const auto& bucket       = buckets.begin()->second;
+        const auto  covers_table = [&](const torch::Tensor& destination, const std::vector<torch::Tensor>& sources) {
+            if (row != destination.size(1) || static_cast<int64_t>(bucket.rows.size()) != row
+                || sources.size() != bucket.rows.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < sources.size(); ++i) {
+                // All rows must be existing snapshots, in the gathered batch
+                // order, with no new rows or wider zero-padded destination.
+                if (bucket.rows[i] != static_cast<int64_t>(i) || sources[i].device() != destination.device()
+                    || sources[i].size(0) != destination.size(0) || sources[i].size(2) != destination.size(2)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (covers_table(model_input.kv_cache_block_id, bucket.physical_tables)
+            && covers_table(model_input.kv_cache_kernel_block_id, bucket.kernel_tables)) {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.compact_tail(cache_snapshot_cat)");
+            // The generic gather's uploads have already happened. Avoid the
+            // extra row-index H2D and index_copy for these fully replaced tables.
+            auto physical                        = torch::cat(bucket.physical_tables, 1);
+            auto kernel                          = torch::cat(bucket.kernel_tables, 1);
+            model_input.kv_cache_block_id        = std::move(physical);
+            model_input.kv_cache_kernel_block_id = std::move(kernel);
+            return;
+        }
+    }
+
     auto overlay =
         [](torch::Tensor& destination, const std::vector<torch::Tensor>& sources, const std::vector<int64_t>& rows) {
             auto source = torch::cat(sources, 1);
@@ -1252,7 +1317,25 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
             && collectMtpStateProposeSlices(all_streams, propose_slices_gpu, &sequence_lengths_gpu)) {
             auto combo_tokens_gpu         = torch::cat(propose_slices_gpu, 0).to(torch::kInt32);
             model_input.combo_tokens      = std::move(combo_tokens_gpu);
-            model_input.lm_output_indexes = makeCudaInt32Range(model_input.combo_tokens.numel());
+            const auto& indexes           = model_input.lm_output_indexes;
+            const bool  reuse_indexes =
+                useCompactMtpTail() && !is_dspark_ && stream_groups.totalContextBatchSize() == 0
+                && stream_groups.totalDecodeBatchSize() == batch_size && sequence_lengths_gpu.size() == batch_size
+                && model_input.combo_tokens.numel() == static_cast<int64_t>(batch_size) && indexes.defined()
+                && indexes.is_cuda() && indexes.scalar_type() == torch::kInt32 && indexes.dim() == 1
+                && indexes.numel() == static_cast<int64_t>(batch_size) && indexes.is_contiguous()
+                && indexes.device() == model_input.combo_tokens.device()
+                && std::all_of(all_streams.begin(), all_streams.end(), [](const GenerateStreamPtr& stream) {
+                       return stream->hasMtpCacheSnapshot() && stream->maxBatchSize() == 1 && !stream->hasNumBeams();
+                   });
+            if (reuse_indexes) {
+                RTP_LLM_PROFILE_SCOPE("executor.mtp.compact_tail(reuse_decode_lm_indexes)");
+                // gatherDecodeModelInput's normal gather already generated
+                // [0, B) for this all-decode, one-token-per-stream batch. Keep
+                // that allocation; descriptor checks need no device readback.
+            } else {
+                model_input.lm_output_indexes = makeCudaInt32Range(model_input.combo_tokens.numel());
+            }
             if (sequence_lengths_gpu.size() == batch_size) {
                 // next_seq_len includes the carried target token. Shifted
                 // draft KV and target verification both resume at length - 1;

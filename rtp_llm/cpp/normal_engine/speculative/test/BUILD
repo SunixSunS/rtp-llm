@@ -3,6 +3,43 @@ load("@arch_config//:arch_select.bzl", "torch_deps")
 
 cc_test = cc_test_wrapper
 
+# Python test entry into the production sampler and native d2t mapping.
+cc_binary(
+    name = "test_fast_topk_sampler",
+    srcs = ["FastTopKSamplerPyTest.cc"],
+    copts = copts(),
+    linkshared = True,
+    deps = [
+        "//rtp_llm/cpp/normal_engine",
+        "//rtp_llm/models_py/bindings/core:exec_ctx_rocm",
+    ] + torch_deps(),
+    target_compatible_with = select({
+        "@//:using_rocm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+py_test(
+    name = "fast_topk_sampler_test",
+    srcs = ["fast_topk_sampler_test.py"],
+    data = [":test_fast_topk_sampler"],
+    deps = [
+        "//rtp_llm:torch",
+        "//rtp_llm:aiter",
+        "//rtp_llm:triton",
+    ],
+    env = {
+        "RTP_LLM_MTP_TAIL_SPLIT_TOP1": "1",
+        "TEST_USING_DEVICE": "ROCM",
+    },
+    tags = ["MI308X-ROCM7"],
+    exec_properties = {"gpu": "MI308X-ROCM7"},
+    target_compatible_with = select({
+        "@//:using_rocm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
 test_copts = [
     "-fno-access-control",
 ] + copts()

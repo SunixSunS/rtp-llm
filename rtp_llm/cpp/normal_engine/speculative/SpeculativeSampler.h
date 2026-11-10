@@ -43,6 +43,10 @@ public:
 
     virtual FastTopKSamplerOutput forward(const torch::Tensor& logits, int top_k = 1);
 
+    // Opt-in greedy selection for the post-extend tail only. Unsupported inputs
+    // keep the regular virtual forward path, including sampler overrides.
+    FastTopKSamplerOutput forwardTail(const torch::Tensor& logits);
+
 private:
     torch::Tensor d2t_map_;
 };

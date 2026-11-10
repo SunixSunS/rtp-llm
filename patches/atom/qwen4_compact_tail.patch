@@ -1,0 +1,22 @@
+diff --git a/atom/plugin/rtpllm/utils/qwen4_exp_context.py b/atom/plugin/rtpllm/utils/qwen4_exp_context.py
+--- a/atom/plugin/rtpllm/utils/qwen4_exp_context.py
++++ b/atom/plugin/rtpllm/utils/qwen4_exp_context.py
+@@ -1011,10 +1011,17 @@
+             ple_inputs = tagged_inputs.get("ple_conv_state")
+             ngram_inputs = tagged_inputs.get("ple_ngram_ctx")
+             ple_state_metadata = ngram_state_metadata = None
+-            for tag, tagged, buffer_key in (
++            ple_state_tags = (
+                 ("ple_conv_state", ple_inputs, "ple_previous_state_slots_i32"),
+                 ("ple_ngram_ctx", ngram_inputs, "ple_ngram_previous_state_slots_i32"),
++            )
++            if (
++                os.environ.get("ATOM_RTP_SKIP_UNUSED_PLE_METADATA") == "1"
++                and all(layer.ple is None for layer in model.model.layers)
+             ):
++                # These two state metadata objects have no consumer without PLE.
++                ple_state_tags = ()
++            for tag, tagged, buffer_key in ple_state_tags:
+                 if tagged is None:
+                     raise ValueError(f"Qwen4Exp requires RTP's {tag} cache tag")
+                 tagged_buffers = graph_buffers

@@ -502,34 +502,39 @@ void MtpExecutor::checkModelInputsOnCuda(const GptModelInputs& model_input, cons
 
 MtpExecutor::AcceptLenMetricsSnapshot MtpExecutor::consumePendingAcceptLenMetrics() {
     AcceptLenMetricsSnapshot snapshot;
-    if (!metrics_accept_len_sum_cpu_.defined()) {
+    if (!metrics_accept_len_sum_cpu_.defined() && !metrics_accept_len_rows_cpu_.defined()) {
         return snapshot;
     }
 
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(consume_accept_len_metrics)");
-    if (metrics_accept_len_ready_event_) {
+    if (metrics_accept_len_ready_event_ && !metrics_accept_len_ready_event_->query()) {
         // This waits for the previous decode step's tiny D2H only; the current
         // step's accept_len is staged below and reported on the next iteration.
         metrics_accept_len_ready_event_->synchronize();
     }
 
-    snapshot.total_accept_len        = metrics_accept_len_sum_cpu_.item<int64_t>();
+    const bool reuse_sampler_rows    = !metrics_accept_len_sum_cpu_.defined();
+    snapshot.total_accept_len        = reuse_sampler_rows ? 0 : metrics_accept_len_sum_cpu_.item<int64_t>();
     snapshot.total_stream_num        = metrics_accept_len_stream_num_;
     snapshot.total_propose_token_num = metrics_accept_len_propose_token_num_;
     if (metrics_accept_len_rows_cpu_.defined() && metrics_accept_len_rows_cpu_.numel() > 0) {
         // Rebuild priority buckets from the staged per-stream rows. Every row is
         // attributed to a bucket, so the bucket sums always equal the scalar
         // total_accept_len computed from the same tensor.
-        const auto*   rows     = metrics_accept_len_rows_cpu_.data_ptr<int64_t>();
         const int64_t num_rows = metrics_accept_len_rows_cpu_.numel();
         for (int64_t i = 0; i < num_rows; ++i) {
+            const int64_t value    = reuse_sampler_rows ? metrics_accept_len_rows_cpu_.data_ptr<int32_t>()[i] :
+                                                          metrics_accept_len_rows_cpu_.data_ptr<int64_t>()[i];
             int32_t priority = 0;
             if (i < static_cast<int64_t>(metrics_accept_len_row_priorities_.size())) {
                 priority = metrics_accept_len_row_priorities_[i];
             } else if (!metrics_accept_len_row_priorities_.empty()) {
                 priority = metrics_accept_len_row_priorities_.back();
             }
-            snapshot.accept_len_by_priority[priority] += rows[i];
+            snapshot.accept_len_by_priority[priority] += value;
+            if (reuse_sampler_rows) {
+                snapshot.total_accept_len += value;
+            }
         }
     }
     snapshot.valid = true;
@@ -545,10 +550,12 @@ MtpExecutor::AcceptLenMetricsSnapshot MtpExecutor::consumePendingAcceptLenMetric
     return snapshot;
 }
 
-void MtpExecutor::stageAcceptLenMetrics(const torch::Tensor& accept_len,
-                                        torch::Event&        accept_len_ready_event,
-                                        size_t               stream_count,
-                                        std::vector<int32_t> row_priorities) {
+void MtpExecutor::stageAcceptLenMetrics(const torch::Tensor&          accept_len,
+                                        torch::Event&                 accept_len_ready_event,
+                                        size_t                        stream_count,
+                                        std::vector<int32_t>          row_priorities,
+                                        const torch::Tensor&          sampler_rows_cpu,
+                                        std::shared_ptr<torch::Event> sampler_rows_ready) {
     if (!accept_len.defined()) {
         return;
     }
@@ -557,6 +564,24 @@ void MtpExecutor::stageAcceptLenMetrics(const torch::Tensor& accept_len,
     metrics_accept_len_stream_num_        = static_cast<int64_t>(stream_count);
     metrics_accept_len_propose_token_num_ = static_cast<int64_t>(stream_count * propose_step_);
     metrics_accept_len_row_priorities_    = std::move(row_priorities);
+
+    if (sampler_rows_cpu.defined()) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(reuse_sampler_accept_len_metrics)");
+        RTP_LLM_CHECK_WITH_INFO(sampler_rows_cpu.device().is_cpu() && sampler_rows_cpu.scalar_type() == torch::kInt32
+                                    && sampler_rows_cpu.is_contiguous()
+                                    && sampler_rows_cpu.numel() == accept_len.numel() && sampler_rows_ready != nullptr,
+                                "sampler metrics require matching CPU int32 rows and their transfer event");
+        // Reuse the sampler's existing D2H, including any post-sampling cap.
+        // Do not read these rows here. The next consume retains both copy
+        // endpoints and waits for this exact event if bookkeeping has not
+        // already observed it; the narrow async path joins bookkeeping first.
+        metrics_accept_len_sum_gpu_     = torch::Tensor();
+        metrics_accept_len_sum_cpu_     = torch::Tensor();
+        metrics_accept_len_rows_gpu_    = accept_len;
+        metrics_accept_len_rows_cpu_    = sampler_rows_cpu;
+        metrics_accept_len_ready_event_ = std::move(sampler_rows_ready);
+        return;
+    }
 
     if (!accept_len.is_cuda()) {
         metrics_accept_len_sum_gpu_  = torch::Tensor();
@@ -2062,7 +2087,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             // Tail is commit-only; the proposal lives and dies inside one
             // round, so no bookkeeping/PD channel carries it anymore.
         } else {
-            auto fast_topk_sampler_output          = fast_topk_sampler_->forward(draft_prefill_model_output.logits);
+            auto fast_topk_sampler_output          = fast_topk_sampler_->forwardTail(draft_prefill_model_output.logits);
             draft_prefill_sampler_output.all_probs = fast_topk_sampler_output.all_probs;
             draft_prefill_sampler_output.token_ids = fast_topk_sampler_output.token_ids;
         }
@@ -2832,10 +2857,17 @@ void MtpExecutor::collectDecodeMetrics(const StreamGroups&                      
     for (const auto& stream : stream_groups.allStreams()) {
         accept_len_row_priorities.push_back(stream->priority());
     }
+    const char* reuse_metrics_env  = std::getenv("RTP_LLM_MTP_REUSE_SAMPLER_METRICS");
+    const bool  reuse_sampler_rows = reuse_metrics_env != nullptr && std::strcmp(reuse_metrics_env, "1") == 0
+                                    && useStreamAsync() && useDropBroadSync()
+                                    && speculative_sampler_output.accept_len_cpu.defined()
+                                    && speculative_sampler_output.transfer_done_event != nullptr;
     stageAcceptLenMetrics(speculative_sampler_output.accept_len,
                           accept_len_ready_event,
                           stream_groups.size(),
-                          std::move(accept_len_row_priorities));
+                          std::move(accept_len_row_priorities),
+                          reuse_sampler_rows ? speculative_sampler_output.accept_len_cpu : torch::Tensor(),
+                          reuse_sampler_rows ? speculative_sampler_output.transfer_done_event : nullptr);
     const int64_t total_accept_len         = accept_len_metrics.total_accept_len;
     executor_collector.generate_batch_size = stream_groups.totalModelBatchSize();
     executor_collector.execute_token_size += total_accept_len;
@@ -3635,10 +3667,28 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         last_hidden_all         = hidden_3d.gather(1, idx_expanded).squeeze(1);
     }
 
-    // 3. One clone for all probs
+    // 3. Retain sampler-owned probabilities, or preserve the clone fallback.
     torch::Tensor draft_probs_all;
     if (draft_all_probs_full.defined()) {
-        draft_probs_all = draft_all_probs_full.clone();
+        static const bool compact_tail = readEnvFlagOnce("RTP_LLM_MTP_COMPACT_TAIL", "mtp-compact-tail", "enabled");
+        const bool        reuse_sampler_probs =
+            compact_tail && useStreamAsync() && useDeviceInput() && !warm_up_ && !is_dspark_ && propose_step_ > 1
+            && batch_size > 0 && stream_groups.totalContextBatchSize() == 0
+            && stream_groups.totalDecodeBatchSize() == static_cast<size_t>(batch_size) && draft_all_probs_full.is_cuda()
+            && draft_all_probs_full.dim() == 2 && draft_all_probs_full.size(0) == batch_size
+            && draft_all_probs_full.is_contiguous()
+            && std::all_of(all_streams.begin(), all_streams.end(), [](const GenerateStreamPtr& stream) {
+                   return stream->hasMtpCacheSnapshot() && stream->maxBatchSize() == 1 && !stream->hasNumBeams();
+               });
+        if (reuse_sampler_probs) {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.compact_tail(reuse_sampler_probs)");
+            // FastTopKSampler allocates all_probs with zeros_like/softmax on
+            // each call; it does not alias the model's captured output. The
+            // per-stream views and worker capture below retain this storage.
+            draft_probs_all = draft_all_probs_full;
+        } else {
+            draft_probs_all = draft_all_probs_full.clone();
+        }
     }
     auto next_position_ids_all =
         is_dspark_ ? advanceDSparkPositionIds(
@@ -3723,7 +3773,7 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
     auto* processor          = batch_stream_processor_.get();
     auto  spec_decode_copy   = spec_decode_output;
     auto  draft_prefill_copy = std::move(draft_prefill_output);
-    // Reuse the owned graph-output copy already published as per-stream device
+    // Reuse the retained probabilities already published as per-stream device
     // state instead of cloning every vocabulary-sized row in the worker.
     if (draft_probs_all.defined()) {
         draft_prefill_copy.sampler_output.all_probs = draft_probs_all;

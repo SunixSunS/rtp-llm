@@ -41,6 +41,7 @@ cc_library(
         ],
         "@//:using_rocm": [
             "//rtp_llm/cpp/cuda_graph:cuda_graph_impl",
+            "//rtp_llm/models_py/bindings/cuda/kernels:mtp_cache_table_advance",
         ],
         "//conditions:default": [],
     }),
