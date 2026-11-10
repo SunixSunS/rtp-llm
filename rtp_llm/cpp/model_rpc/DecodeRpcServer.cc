@@ -64,6 +64,17 @@ namespace rtp_llm {
 
 namespace {
 
+const LinearKVCacheSpec* segmentedLinearSpec(const CacheConfig& config, const GroupBase& group) {
+    return config.use_mla ? dynamic_cast<const LinearKVCacheSpec*>(group.spec.get()) : nullptr;
+}
+
+bool hasSegmentedLinearGroup(const CacheConfig& config) {
+    const auto& groups = config.groups();
+    return std::any_of(groups.begin(), groups.end(), [&](const GroupBase& group) {
+        return segmentedLinearSpec(config, group) != nullptr;
+    });
+}
+
 // gRPC delivers propose probs/hidden as pageable CPU tensors. Pinning them
 // before the H2D copy lets cudaMemcpyAsync run on the DMA engine instead of
 // falling back to a staged synchronous copy on the handler thread. Pinning is
@@ -720,8 +731,10 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
     RTP_LLM_LOG_DEBUG("request [%s] local generate done", decode_context.request_key.c_str());
 }
 
-BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequestForMla(
-    const LoadKVCacheContext& load_context, int index, const std::vector<std::string>& peer_addrs) const {
+BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequestForMla(const LoadKVCacheContext&       load_context,
+                                                                         int                             index,
+                                                                         const std::vector<std::string>& peer_addrs,
+                                                                         bool collect_linear_shards) const {
     load_context.groupBlockIds().validate();
     BroadcastLoadRequestPB request;
     request.set_request_id(load_context.request_id);
@@ -731,9 +744,9 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequestForMla(
     request.set_partition_id(0);
     request.set_prefill_cp_size(load_context.prefill_cp_size);
 
-    if (load_context.prefill_cp_size > 1) {
-        // CP-sharded prefill: every decode rank must pull the shard owned by
-        // every prefill CP peer.
+    if (load_context.prefill_cp_size > 1 || collect_linear_shards) {
+        // The loader selects page owners for CP and contiguous attention-TP
+        // peers for linear state. Both need the full ordered prefill peer list.
         for (const auto& addr : peer_addrs) {
             request.add_peer_addrs(addr);
         }
@@ -917,8 +930,13 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheAsyncForTp(DecodeGene
         rpc_context.stub  = connect_status.value().stub;
         BroadcastLoadRequestPB load_request;
 
-        if (engine_->resourceContext().cache_manager->cacheConfig().use_mla) {
-            load_request = constructRemoteLoadRequestForMla(load_context, i, decode_context.peer_addrs);
+        const auto& cache_config = engine_->resourceContext().cache_manager->cacheConfig();
+        if (cache_config.use_mla) {
+            const bool collect_linear_shards = decode_context.peer_addrs.size() > static_cast<size_t>(
+                                                   maga_init_params_.parallelism_config.get_attn_tp_size())
+                                               && hasSegmentedLinearGroup(cache_config);
+            load_request =
+                constructRemoteLoadRequestForMla(load_context, i, decode_context.peer_addrs, collect_linear_shards);
         } else {
             load_request = constructRemoteLoadRequest(load_context, i, decode_context.peer_addrs);
         }
@@ -1086,6 +1104,16 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
     };
     const bool is_page_level_rr = load_context.prefill_cp_size > 1
                                   && static_cast<int>(load_context.peer_addrs.size()) == load_context.prefill_cp_size;
+    const auto attn_tp_size = static_cast<int>(maga_init_params_.parallelism_config.get_attn_tp_size());
+    const bool segmented    = use_mla && hasSegmentedLinearGroup(cache_config);
+    if (segmented && peer_cnt > 1 && peer_cnt % attn_tp_size != 0) {
+        return {ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, "prefill peers must divide across decode attention ranks"),
+                0};
+    }
+    const int linear_shard_count = peer_cnt == 1 ? 1 : std::max(1, peer_cnt / attn_tp_size);
+    const int linear_peer_begin =
+        peer_cnt == 1 ? 0 : maga_init_params_.parallelism_config.get_attn_tp_rank() * linear_shard_count;
+    const bool linear_fan_in  = segmented && linear_shard_count > 1;
     auto layerGroupTags = [](const CacheConfig& cfg, bool use_hybrid, size_t layer_id) {
         std::vector<std::string> layer_tags;
         if (use_hybrid) {
@@ -1120,19 +1148,27 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
         }
         return cpMapperForGroup(cfg, tag).layoutForGroup(cfg, tag).slice != CpBlockSliceMode::NONE;
     };
-    auto shouldLoadGroupFromPeer =
-        [&](const CacheConfig& cfg, CacheGroupType group_type, const std::string& tag, int peer_idx) {
-            if (!is_page_level_rr) {
-                return true;
-            }
-            if (group_type == CacheGroupType::FULL) {
-                return true;
-            }
-            // Some specs are CP-sliced inside one logical block on prefill, while
-            // decode still owns the full block. Pull every peer slice and place it
-            // into the destination offset declared by the spec.
-            return groupUsesCpSlice(cfg, tag) || peer_idx == 0;
-        };
+    auto shouldLoadGroupFromPeer = [&](const CacheConfig&       cfg,
+                                       CacheGroupType           group_type,
+                                       const std::string&       tag,
+                                       const LinearKVCacheSpec* linear,
+                                       int                      peer_idx) {
+        if (linear != nullptr) {
+            return peer_idx >= linear_peer_begin && peer_idx < linear_peer_begin + linear_shard_count;
+        }
+        if (!is_page_level_rr) {
+            // Only linear state differs between these TP peers. MLA and
+            // the other groups have replicated pages outside of CP.
+            return !linear_fan_in || peer_idx == 0;
+        }
+        if (group_type == CacheGroupType::FULL) {
+            return true;
+        }
+        // Some specs are CP-sliced inside one logical block on prefill, while
+        // decode still owns the full block. Pull every peer slice and place it
+        // into the destination offset declared by the spec.
+        return groupUsesCpSlice(cfg, tag) || peer_idx == 0;
+    };
     auto shouldLoadBlockFromPeer = [&](CacheGroupType group_type, size_t block_pos, int peer_idx) {
         if (!is_page_level_rr || group_type != CacheGroupType::FULL) {
             return true;
@@ -1147,6 +1183,23 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
             return parts;
         }
         return cpMapperForGroup(cfg, tag).sliceBlockForPeer(cfg, tag, std::move(parts), static_cast<size_t>(peer_idx));
+    };
+    auto addLinearSegments = [&](const LinearKVCacheSpec&      linear,
+                                 const std::vector<BlockInfo>& parts,
+                                 const std::string&            cache_key,
+                                 int                           peer,
+                                 const auto&                   add) {
+        RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 && parts[0].size_bytes == linear.block_size_bytes(),
+                                "invalid linear cache block for key=%s",
+                                cache_key.c_str());
+        const auto segments = linear.transferSegments(linear_shard_count, peer - linear_peer_begin);
+        for (size_t index = 0; index < segments.size(); ++index) {
+            const auto& [offset, bytes] = segments[index];
+            auto segment                = parts.front();
+            segment.addr                = static_cast<char*>(segment.addr) + offset;
+            segment.size_bytes          = bytes;
+            add(makeLinearCacheSegmentKey(index, cache_key), segment);
+        }
     };
     // One projection shared by the main model and MTP, mirroring the producer.
     auto groupLoadPlan =
@@ -1181,11 +1234,12 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                 size_t      model_id  = maga_init_params_.model_id;
 
                 CacheGroupType group_type                    = groupType(cache_config, use_hybrid, tag);
+                const auto*    linear = segmentedLinearSpec(cache_config, cache_config.group(tag));
                 const auto     load_plan                     = groupLoadPlan(cache_config, use_hybrid, tag, block_num);
                 const auto     cache_keys_per_physical_block = cacheKeysPerPhysicalBlock(
                     cache_config.topology().group(tag).seqSizePerBlock(), cache_config.seq_size_per_block);
 
-                if (!shouldLoadGroupFromPeer(cache_config, group_type, tag, i)) {
+                if (!shouldLoadGroupFromPeer(cache_config, group_type, tag, linear, i)) {
                     continue;
                 }
                 for (const auto& plan_pair : load_plan) {
@@ -1236,7 +1290,9 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                             key, addr, static_cast<uint32_t>(block.size_bytes), block.is_cuda, true);
                     };
 
-                    if (use_kv_key_prefix) {
+                    if (linear != nullptr) {
+                        addLinearSegments(*linear, parts, cache_key, i, addBufBlock);
+                    } else if (use_kv_key_prefix) {
                         RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 || parts.size() == 2,
                                                 "unexpected mla convertIndexToBuffer parts size=%zu",
                                                 parts.size());
@@ -1313,12 +1369,13 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                             size_t      model_id  = module_plan.cache_model_id;
 
                             CacheGroupType group_type = groupType(mtp_cache_cfg, mtp_use_hybrid, tag);
+                            const auto*    linear     = segmentedLinearSpec(mtp_cache_cfg, mtp_cache_cfg.group(tag));
                             const auto     load_plan  = groupLoadPlan(mtp_cache_cfg, mtp_use_hybrid, tag, block_num);
                             const auto     cache_keys_per_physical_block =
                                 cacheKeysPerPhysicalBlock(mtp_cache_cfg.topology().group(tag).seqSizePerBlock(),
                                                           mtp_cache_cfg.seq_size_per_block);
 
-                            if (!shouldLoadGroupFromPeer(mtp_cache_cfg, group_type, tag, i)) {
+                            if (!shouldLoadGroupFromPeer(mtp_cache_cfg, group_type, tag, linear, i)) {
                                 continue;
                             }
                             for (const auto& plan_pair : load_plan) {
@@ -1377,7 +1434,9 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                                         key, addr, static_cast<uint32_t>(block.size_bytes), block.is_cuda, true);
                                 };
 
-                                if (mtp_use_kv_key_prefix) {
+                                if (linear != nullptr) {
+                                    addLinearSegments(*linear, parts, cache_key, i, addBufBlock);
+                                } else if (mtp_use_kv_key_prefix) {
                                     RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 || parts.size() == 2,
                                                             "unexpected mtp mla convertIndexToBuffer parts size=%zu",
                                                             parts.size());

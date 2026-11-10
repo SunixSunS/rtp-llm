@@ -111,9 +111,10 @@ private:
         cfg.dtype                   = spec->memoryLayoutDType();
         cfg.local_head_num_kv       = local_kv_head_num;
         cfg.enable_hybrid_attention = enable_hybrid_attention;
-        // Scale 3D layout for MLA and indexer; KV 3D only for MLA (concat_and_cache_mla)
+        // Keep the scale layout for sparse attention, but reshape only the
+        // actual MLA pool by token. Opaque and linear state are physical pages.
         cfg.is_mla                     = cache_config.use_mla || cache_config.is_sparse;
-        cfg.use_mla                    = cache_config.use_mla;
+        cfg.use_mla = cache_config.use_mla && spec->type == KVCacheSpecType::MultiHeadLatentAttention;
         cfg.seq_size_per_block         = seq_size_per_block;
         cfg.kernel_blocks_per_kv_block = kernel_blocks_per_kv_block;
 
