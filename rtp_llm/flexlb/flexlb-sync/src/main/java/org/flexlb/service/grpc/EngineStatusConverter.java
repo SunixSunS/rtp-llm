@@ -71,12 +71,14 @@ public class EngineStatusConverter {
         cacheStatus.setBlockSize(cacheStatusPB.getBlockSize());
         cacheStatus.setVersion(cacheStatusPB.getVersion());
 
-        Map<Long, Boolean> cacheKeysMap = cacheStatusPB.getCacheKeysMap();
-        // Copy the keySet: protobuf MapField#keySet() returns a VIEW that keeps
-        // the whole WorkerStatusPB message graph reachable until the next sync.
-        Set<Long> cachedKeysSet = new HashSet<>(cacheKeysMap.keySet());
+        // Copy the keys so the cache snapshot does not retain the protobuf response.
+        Set<Long> cachedKeysSet =
+                new HashSet<>(
+                        cacheStatusPB.getCacheKeyListCount() > 0
+                                ? cacheStatusPB.getCacheKeyListList()
+                                : cacheStatusPB.getCacheKeysMap().keySet());
         cacheStatus.setCachedKeys(cachedKeysSet);
-        cacheStatus.setCacheKeySize(cacheKeysMap.size());
+        cacheStatus.setCacheKeySize(cachedKeysSet.size());
         return cacheStatus;
     }
 

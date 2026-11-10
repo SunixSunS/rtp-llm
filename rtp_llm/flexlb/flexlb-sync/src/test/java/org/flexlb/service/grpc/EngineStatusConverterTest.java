@@ -26,6 +26,35 @@ class EngineStatusConverterTest {
                     RoleType.PREFILL, "default", "127.0.0.1", 8001, 18002, "test");
 
     @Test
+    void prefersPackedCacheKeysAndPreservesSignedValues() throws Exception {
+        var message =
+                EngineRpcService.CacheStatusPB.newBuilder()
+                        .putCacheKeys(42L, true)
+                        .addCacheKeyList(Long.MIN_VALUE)
+                        .addCacheKeyList(Long.MAX_VALUE)
+                        .addCacheKeyList(Long.MIN_VALUE)
+                        .build();
+        var decoded = EngineRpcService.CacheStatusPB.parseFrom(message.toByteArray());
+        var status = EngineStatusConverter.convertToCacheStatus(decoded);
+
+        assertEquals(Set.of(Long.MIN_VALUE, Long.MAX_VALUE), status.getCachedKeys());
+        assertEquals(2, status.getCacheKeySize());
+    }
+
+    @Test
+    void fallsBackToLegacyCacheMapWhenThePackedListIsEmpty() {
+        var message =
+                EngineRpcService.CacheStatusPB.newBuilder()
+                        .putCacheKeys(1L, true)
+                        .putCacheKeys(2L, false)
+                        .build();
+        var status = EngineStatusConverter.convertToCacheStatus(message);
+
+        assertEquals(Set.of(1L, 2L), status.getCachedKeys());
+        assertEquals(2, status.getCacheKeySize());
+    }
+
+    @Test
     void preservesAllActiveTaskPhasesAndKeepsFinishedTasksSeparate() {
         var status =
                 statusBuilder()
