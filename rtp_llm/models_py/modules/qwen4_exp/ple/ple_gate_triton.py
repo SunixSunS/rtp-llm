@@ -19,34 +19,27 @@ def _sm_supported(device: torch.device) -> bool:
 
 
 @triton.jit
-def _ple_gate(
+def _gate_branch(
     Key,
     Value,
     Hidden,
     GK,
     GQ,
     GC,
-    Gated,
-    Normed,
     KS,
     VS,
-    WIDTH: tl.constexpr,
+    row,
+    col,
+    hc_col,
+    valid,
     H: tl.constexpr,
     EPS: tl.constexpr,
     KEY_STRIDE: tl.constexpr,
     VALUE_STRIDE: tl.constexpr,
     HIDDEN_STRIDE: tl.constexpr,
-    BLOCK: tl.constexpr,
     PROJECTED_FP32: tl.constexpr = False,
     PAGE: tl.constexpr = 128,
 ):
-    # row * WIDTH exceeds int32 once a single prefill step passes ~2^31/10240
-    # rows; max_seq_len=262144 allows that, so promote before multiplying.
-    row = tl.program_id(0).to(tl.int64)
-    branch = tl.program_id(1)
-    col = tl.arange(0, BLOCK)
-    valid = col < H
-    hc_col = branch * H + col
     k = tl.load(Key + row * KEY_STRIDE + hc_col, valid, other=0).to(tl.float32)
     if PROJECTED_FP32:
         k = (k * tl.load(KS + row // PAGE)).to(tl.bfloat16).to(tl.float32)
@@ -73,6 +66,40 @@ def _ple_gate(
     f = gated.to(tl.float32)
     gc = tl.load(GC + hc_col, valid, other=0).to(tl.float32)
     normed = f * tl.rsqrt(tl.sum(f * f, 0) / H + EPS) * (1 + gc)
+    return gated, normed.to(tl.bfloat16)
+
+
+@triton.jit
+def _ple_gate(
+    Key,
+    Value,
+    Hidden,
+    GK,
+    GQ,
+    GC,
+    Gated,
+    Normed,
+    KS,
+    VS,
+    WIDTH: tl.constexpr,
+    H: tl.constexpr,
+    EPS: tl.constexpr,
+    KEY_STRIDE: tl.constexpr,
+    VALUE_STRIDE: tl.constexpr,
+    HIDDEN_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PROJECTED_FP32: tl.constexpr = False,
+    PAGE: tl.constexpr = 128,
+):
+    # The row offset can exceed int32 for long prefill sequences.
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    valid = col < H
+    hc_col = tl.program_id(1) * H + col
+    gated, normed = _gate_branch(
+        Key, Value, Hidden, GK, GQ, GC, KS, VS, row, col, hc_col, valid,
+        H, EPS, KEY_STRIDE, VALUE_STRIDE, HIDDEN_STRIDE, PROJECTED_FP32, PAGE,
+    )
     tl.store(Gated + row * WIDTH + hc_col, gated, valid)
     tl.store(Normed + row * WIDTH + hc_col, normed, valid)
 
@@ -111,7 +138,9 @@ def try_ple_gate(
         and _sm_supported(hidden.device)
         and hidden.ndim == 3
         and (
-            hidden.shape[0] == 1 or all(x.is_contiguous() for x in (key, value, hidden))
+            hidden.shape[0] == 1
+            or hidden.shape[1] == 1
+            or all(x.is_contiguous() for x in (key, value, hidden))
         )
         and hidden.dtype == torch.bfloat16
         and key.dtype == value.dtype == (torch.float32 if projected else torch.bfloat16)
@@ -138,6 +167,8 @@ def try_ple_gate(
     gated = torch.empty(hidden.shape, device=hidden.device, dtype=hidden.dtype)
     normed = torch.empty_like(gated)
     if hidden.shape[1]:
+        # S=1 projection views may have the packed K/V row stride.
+        row_dim = 0 if hidden.shape[1] == 1 else 1
         _ple_gate[(hidden.shape[0] * hidden.shape[1], 4)](
             key,
             value,
@@ -151,9 +182,9 @@ def try_ple_gate(
             WIDTH=10240,
             H=2560,
             EPS=eps,
-            KEY_STRIDE=key.stride(1),
-            VALUE_STRIDE=value.stride(1),
-            HIDDEN_STRIDE=hidden.stride(1),
+            KEY_STRIDE=key.stride(row_dim),
+            VALUE_STRIDE=value.stride(row_dim),
+            HIDDEN_STRIDE=hidden.stride(row_dim),
             BLOCK=4096,
             num_warps=4,
             PROJECTED_FP32=projected,
