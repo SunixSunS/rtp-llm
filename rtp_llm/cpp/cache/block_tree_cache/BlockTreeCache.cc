@@ -14,6 +14,43 @@
 #include "rtp_llm/cpp/utils/Logger.h"
 
 namespace rtp_llm {
+namespace {
+
+StorageRequest makeStorageRequest(const BlockTree&                                  tree,
+                                  const CacheKeysType&                              cache_keys,
+                                  const std::vector<std::vector<GroupSetResource>>& resources,
+                                  const std::optional<int64_t>&                     request_id,
+                                  size_t                                            remote_reuse_begin,
+                                  size_t                                            remote_reuse_end) {
+    RTP_LLM_CHECK(remote_reuse_begin <= remote_reuse_end && remote_reuse_end <= cache_keys.size());
+    const size_t key_count = cache_keys.size() - (remote_reuse_end - remote_reuse_begin);
+    auto         keys      = std::make_shared<CacheKeysType>();
+    keys->reserve(key_count);
+    keys->insert(keys->end(), cache_keys.begin(), cache_keys.begin() + remote_reuse_begin);
+    keys->insert(keys->end(), cache_keys.begin() + remote_reuse_end, cache_keys.end());
+    StorageRequest request{std::move(keys), std::vector<std::vector<StorageBlockHandle>>(key_count)};
+    request.request_id = request_id;
+    size_t output      = 0;
+    for (size_t key_index = 0; key_index < resources.size(); ++key_index) {
+        if (key_index >= remote_reuse_begin && key_index < remote_reuse_end) {
+            continue;
+        }
+        auto& key_handles = request.handles[output++];
+        for (size_t group_set = 0; group_set < tree.groupSets().size(); ++group_set) {
+            const auto& resource = resources[key_index][group_set];
+            if (!resource.hasCompleteDeviceValue()) {
+                continue;
+            }
+            const auto& group = *tree.groupSets()[group_set];
+            for (size_t member = 0; member < group.groupTags().size(); ++member) {
+                key_handles.push_back({group.groupTags()[member], resource.device_blocks[member]});
+            }
+        }
+    }
+    return request;
+}
+
+}  // namespace
 
 BlockTreeCache::BlockTreeCache(std::unique_ptr<BlockTree>                     tree,
                                BlockTreeCacheConfig                           config,
@@ -50,16 +87,6 @@ BlockTreeCache::BlockTreeCache(std::unique_ptr<BlockTree>                     tr
             config_.disk_cache_sync_timeout_ms,
             config_.host_cache_sync_timeout_ms,
             config_.enable_device_cache,
-            storage_backend_,
-            [this](bool check_watermark) { onWorkflowSettledLocked(check_watermark); }),
-    storer_(tree_.get(),
-            evictor_,
-            transfer_dispatcher_.get(),
-            task_pool_.get(),
-            *metrics_reporter_,
-            mutex_,
-            config_.host_cache_sync_timeout_ms,
-            config_.disk_cache_evict_timeout_ms,
             storage_backend_,
             [this](bool check_watermark) { onWorkflowSettledLocked(check_watermark); }) {
     if (storage_backend_)
@@ -113,11 +140,7 @@ BlockTreeCache::~BlockTreeCache() {
     if (storage_backend_) {
         storage_backend_->shutdown();
     }
-    RTP_LLM_LOG_INFO("load tickets closed, stopping store admission and draining cache tasks...");
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        storer_.stopAdmissionLocked();
-    }
+    RTP_LLM_LOG_INFO("load tickets closed, draining cache tasks...");
     task_pool_->stopAdmission();
     transfer_dispatcher_->cancelPendingStagingTransfers();
     task_pool_->waitForIdle();
@@ -175,8 +198,24 @@ size_t BlockTreeCache::insert(const CacheKeysType&                              
     StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        storage_write = storer_.storeLocked(cache_keys, resources, target_tier, is_resident, resident_prefix_length,
-                                            request_id, remote_reuse_begin, remote_reuse_end);
+        RTP_LLM_CHECK_WITH_INFO(
+            target_tier == Tier::DEVICE, "unsupported insert target tier: %s", tierName(target_tier));
+        const BlockTreeInsertResult insert_result = tree_->insertNode(cache_keys, resources, false, is_resident);
+        if (insert_result.hard_stop) {
+            metrics_reporter_->reportInsertHardStop(*insert_result.hard_stop);
+        }
+        const bool resources_inserted = !insert_result.inserted_nodes.empty() || !insert_result.adopted_nodes.empty();
+        if (resources_inserted || !insert_result.newly_resident_nodes.empty()) {
+            evictor_.onInserted(insert_result);
+        }
+        if (resources_inserted) {
+            onWorkflowSettledLocked(true);
+        }
+        resident_prefix_length = insert_result.resident_prefix_length;
+        if (storage_backend_) {
+            storage_write = storage_backend_->prepareWrite(
+                makeStorageRequest(*tree_, cache_keys, resources, request_id, remote_reuse_begin, remote_reuse_end));
+        }
     }
     if (storage_write) {
         storage_backend_->write(std::move(storage_write));

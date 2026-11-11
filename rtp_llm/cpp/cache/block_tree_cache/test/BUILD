@@ -139,6 +139,24 @@ cc_test(
 )
 
 cc_test(
+    name = "block_tree_cache_insert_test",
+    exec_properties = {"gpu": "L20_CU13"},
+    testonly = True,
+    srcs = ["BlockTreeCacheInsertTest.cc"],
+    copts = test_copts,
+    tags = [
+        "L20_CU13",
+        "exclusive-if-local",
+    ],
+    deps = test_deps + [
+        ":block_tree_cache_test_utils",
+        ":bounded_thread_test_utils",
+        "//rtp_llm/cpp/cache:cache_async_context",
+    ],
+    env = {},
+)
+
+cc_test(
     name = "block_tree_cache_integration_test",
     exec_properties = {"gpu": "L20_CU13"},
     testonly = True,
